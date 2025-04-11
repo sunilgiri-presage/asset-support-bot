@@ -1,0 +1,7 @@
+FROM nginx:stable-alpine
+
+# Remove all default configurations in /etc/nginx/conf.d/
+RUN rm -rf /etc/nginx/conf.d/*
+
+# Copy your custom configuration file
+COPY config/nginx.conf /etc/nginx/conf.d/asset_support.conf

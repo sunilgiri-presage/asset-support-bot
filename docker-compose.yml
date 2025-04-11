@@ -1,0 +1,83 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: Sunilgiri@1#
+      POSTGRES_DB: asset_support_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      retries: 5
+    networks:
+      - mynetwork
+
+  redis:
+    image: redis:6
+    ports:
+      - "6379:6379"
+    networks:
+      - mynetwork
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: gunicorn asset_support_bot.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120 --limit-request-field_size 0 --limit-request-line 0
+    volumes:
+      - .:/app
+      - ./media:/app/media
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    expose:
+      - "8000"
+    networks:
+      - mynetwork
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A asset_support_bot worker -l info
+    volumes:
+      - .:/app
+      - ./media:/app/media  # Add this if your tasks need access to uploaded files
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
+    networks:
+      - mynetwork
+
+  cnginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    depends_on:
+      - web
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/conf.d/asset_support.conf:ro
+      - static_volume:/app/staticfiles
+    networks:
+      - mynetwork
+
+volumes:
+  postgres_data:
+  static_volume:
+
+networks:
+  mynetwork:
