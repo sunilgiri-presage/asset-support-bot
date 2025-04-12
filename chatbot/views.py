@@ -146,6 +146,8 @@ class ChatbotViewSet(viewsets.ViewSet):
                 response_content = self._handle_fetch_data(asset_id, message_content, timings)
             elif action_type == "web_search":
                 response_content = self._handle_web_search(message_content, timings)
+            elif action_type == "conversation_recall":
+                response_content = self._handle_conversation_recall(message_content, asset_id, conversation, timings)
             else:
                 logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
                 response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
@@ -195,33 +197,52 @@ class ChatbotViewSet(viewsets.ViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    
     def _determine_action_type(self, user_query):
         mistral_client = MistralLLMClient()
         json_format_str = '{"action": "selected_action"}'
         prompt = f"""
-    You are a smart task routing bot. Your job is to analyze the user's query and decide the best method to respond based on its semantic context.
+    You are a smart task routing bot analyzing user queries to determine the most appropriate action to take.
+    Your task is CRITICAL: you must correctly identify when queries should be answered from conversation history rather than external sources.
+
     Your available actions are:
 
-    1. "document_query": Use this action when the query asks for information that can be answered from internal documentation, such as configuration instructions, technical manuals, or API parameter details.
-    2. "fetch_data": Use this action when the query is asking for specific, structured data that should be fetched from an API response.
-    3. "web_search": Use this action when the query requires current or trending information from the web.
-    
+    1. "document_query": Use this for questions about technical documentation, API details, or product specifications.
+    2. "fetch_data": Use this for requests about retrieving structured data like stats, metrics, or database information.
+    3. "web_search": Use this when the query needs current information from the internet about general topics, news, or public figures.
+    4. "conversation_recall": MOST IMPORTANTLY, use this whenever:
+    - The query refers to personal information that a user likely shared earlier (names, roles, preferences, characteristics)
+    - The query asks about "me", "my", "I", or "mine" (like "my name", "my job", "my company")
+    - The query references previous conversations or shared details
+    - The query asks about specific people by name who are likely conversation participants, not public figures
+    - The query is checking if the assistant remembers something
+    - The query is following up on previously shared personal information
+
+    CRITICAL PATTERNS to identify as "conversation_recall":
+    - Queries containing "tell me about [person name]" when that person is likely a conversation participant
+    - Queries asking about someone's name, job, role, company, or personal details
+    - Queries with phrases like "who am I", "what's my name", "where do I work"
+    - Queries that seem to reference personal information previously shared
+
+    Remember: Document queries, web searches, and external data will NOT have information about the specific user you're talking to right now. Only conversation history has this.
+
     Instructions:
     - Return only a valid JSON object in exactly this format: {json_format_str}
-    - Do NOT include any explanation or HTML.
-    
+    - DO NOT include any explanation or HTML.
+    - Choose carefully - routing personal information queries to web_search or document_query will always give incorrect results.
+
     User Query: "{user_query}"
     """
         try:
             response = mistral_client.generate_response(prompt=prompt, context="")
             logger.info("Action determination response: %s", response)
 
-            match = re.search(r'\{.*?"action"\s*:\s*"(document_query|fetch_data|web_search)".*?\}', response)
+            match = re.search(r'\{.*?"action"\s*:\s*"(document_query|fetch_data|web_search|conversation_recall)".*?\}', response)
             if match:
                 action_json_str = match.group(0)
                 response_json = json.loads(action_json_str)
                 action = response_json.get('action')
-                if action in ["document_query", "fetch_data", "web_search"]:
+                if action in ["document_query", "fetch_data", "web_search", "conversation_recall"]:
                     return action
                 else:
                     logger.warning("Invalid action type received: %s. Defaulting to document_query.", action)
@@ -236,6 +257,14 @@ class ChatbotViewSet(viewsets.ViewSet):
 
     def _handle_document_query(self, message_content, asset_id, conversation, timings):
         logger.info(f"Handling document query: {message_content}")
+        if self._check_circuit_breaker():
+            timings['circuit_breaker'] = "OPEN - preventing potential timeout"
+            return (
+                "<div class='system-message'>"
+                "<p>I'm currently experiencing high load and can't process complex document "
+                "queries right now. Please try again in a minute or ask a simpler question.</p>"
+                "</div>"
+            )
         
         # 1. PREPARE BOTH DOCUMENT AND CONVERSATION CONTEXT IN PARALLEL
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -576,7 +605,7 @@ Instructions:
             logger.info("Primary retrieval failed, attempting fallback method")
             fallback_chunks = pinecone_client.get_fallback_chunks(
                 asset_id, 
-                query=processed_query,  # Pass the query for possible keyword filtering
+                query=processed_query,
                 limit=top_k
             )
             if fallback_chunks:
@@ -821,6 +850,185 @@ Instructions:
                 "<p>Please try again with a more specific question or try again shortly.</p>"
                 "</div>"
             )
+        
+    def _handle_conversation_recall(self, message_content, asset_id, conversation, timings):
+        """
+        Handle queries by focusing exclusively on conversation history for the asset.
+        This is optimized for recalling personal information shared by users.
+        """
+        logger.info(f"Handling conversation recall for asset_id: {asset_id}")
+        
+        # Start timing
+        recall_start = time.perf_counter()
+        
+        # 1. First gather current conversation messages
+        current_messages = list(
+            Message.objects.filter(conversation=conversation).order_by('created_at')
+        )
+        
+        # 2. Build the current conversation context with higher message limit
+        current_conversation_context = ""
+        if current_messages:
+            current_conversation_context = self._build_conversation_context(conversation, max_recent=30)
+        
+        # 3. Also find other conversations for this asset to get more context
+        # But only if we need more information
+        all_contexts = [current_conversation_context] if current_conversation_context else []
+        
+        if len(current_messages) < 5:  # Only search other conversations if current one is short
+            logger.info("Current conversation is short, looking for other conversations for this asset")
+            other_conversations = Conversation.objects.filter(
+                asset_id=asset_id
+            ).exclude(
+                id=conversation.id
+            ).order_by('-updated_at')[:3]
+            
+            for other_conv in other_conversations:
+                other_context = self._build_conversation_context(other_conv, max_recent=15)
+                if other_context:
+                    all_contexts.append(f"Previous conversation:\n{other_context}")
+        
+        full_conversation_context = "\n\n".join([ctx for ctx in all_contexts if ctx])
+        
+        # If we have no context at all, handle gracefully
+        if not full_conversation_context:
+            logger.warning("No conversation context found for conversation recall")
+            return (
+                "<div class='response-container'>"
+                "<p>I don't seem to have any previous conversation information about that. "
+                "Could you please provide more details?</p>"
+                "</div>"
+            )
+        
+        # 4. Extract relevant information from the user query to better focus recall
+        query_keywords = self._extract_query_keywords(message_content)
+        logger.info(f"Extracted keywords for conversation recall: {query_keywords}")
+        
+        # 5. Create an optimized prompt specifically for conversation recall with query focus
+        prompt = f"""
+    You are an assistant that recalls information from conversation history.
+    Your ONLY task is to answer based on the conversation history provided below.
+
+    Conversation History:
+    {full_conversation_context}
+
+    Current User Query:
+    {message_content}
+
+    Query Focus Keywords:
+    {', '.join(query_keywords)}
+
+    IMPORTANT INSTRUCTIONS:
+    1. Answer EXCLUSIVELY based on information found in the conversation history above.
+    2. DO NOT use any external knowledge, web information, or made-up details.
+    3. If the conversation history contains the information requested, provide it clearly and concisely.
+    4. If the information is NOT in the conversation history, explicitly state: "I don't have that information in our conversation history."
+    5. Focus especially on personal details the user has shared about themselves or others in the conversation.
+    6. Present your response in a natural, conversational manner.
+    7. Don't mention that you're using "conversation recall" or explain your methodology.
+    """
+
+        # 6. Select appropriate LLM - use MistralLLM for conversation recall
+        llm_client = MistralLLMClient()
+        
+        # 7. Generate response with timeout protection
+        llm_start = time.perf_counter()
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    llm_client.generate_response,
+                    prompt=message_content,
+                    context=prompt
+                )
+                # Set a timeout for LLM response
+                response_content = future.result(timeout=15.0)
+        except concurrent.futures.TimeoutError:
+            logger.error("LLM response generation for conversation recall timed out after 15 seconds")
+            response_content = (
+                "<div class='response-container'>"
+                "<p>I'm having trouble recalling details from our conversation right now. "
+                "Could you please repeat your question or provide more specifics?</p>"
+                "</div>"
+            )
+        except Exception as e:
+            logger.error(f"Error generating LLM response for conversation recall: {str(e)}")
+            response_content = (
+                "<div class='response-container'>"
+                f"<p>I encountered an error while trying to recall our conversation. Please try again with a more specific question.</p>"
+                "</div>"
+            )
+        
+        timings['llm_conversation_recall_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
+        timings['total_conversation_recall_time'] = f"{time.perf_counter() - recall_start:.2f} seconds"
+        
+        return response_content
+    
+    def _extract_user_information(self, conversation_context):
+        """Extract key user information from conversation history to aid in recall"""
+        mistral_client = MistralLLMClient()
+        
+        extraction_prompt = f"""
+        Extract key personal information the user has shared about themselves from this conversation.
+        Focus on details like their name, role, preferences, background, etc.
+        Format as JSON with appropriate keys.
+        Only include information explicitly mentioned by the user.
+        
+        Conversation:
+        {conversation_context}
+        """
+        
+        try:
+            info_json_str = mistral_client.generate_response(prompt=extraction_prompt, context="")
+            user_info = json.loads(info_json_str)
+            return user_info
+        except:
+            # Fallback to simpler extraction if JSON parsing fails
+            logger.warning("JSON parsing of user information failed, using simpler extraction")
+            return {"raw_extraction": info_json_str}
+        
+    def _extract_query_keywords(self, query):
+        """Extract key focus words from user query to improve recall precision"""
+        # Remove common stopwords
+        stopwords = {"the", "a", "an", "is", "are", "was", "were", "be", "been", 
+                    "being", "to", "of", "and", "or", "not", "no", "in", "on", 
+                    "at", "by", "for", "with", "about", "against", "between", 
+                    "into", "through", "during", "before", "after", "above", 
+                    "below", "from", "up", "down", "out", "off", "over", "under", 
+                    "again", "further", "then", "once", "here", "there", "when", 
+                    "where", "why", "how", "all", "any", "both", "each", "few", 
+                    "more", "most", "other", "some", "such", "than", "too", "very", 
+                    "can", "will", "just", "should", "now"}
+        
+        # Extract potentially important terms
+        words = query.lower().split()
+        keywords = []
+        
+        # Special handling for "tell me about X" pattern
+        tell_about_match = re.search(r"tell (?:me|us) about ([^?.,!]+)", query.lower())
+        if tell_about_match:
+            subject = tell_about_match.group(1).strip()
+            keywords.append(subject)
+        
+        # Add named entities and non-stopwords
+        for word in words:
+            # Clean the word
+            word = word.strip(".,!?:;\"'()[]{}").lower()
+            
+            # Keep terms that might be names or important identifiers
+            if (word not in stopwords and len(word) > 2) or word[0].isupper():
+                keywords.append(word)
+        
+        # Always look for personal references
+        personal_terms = ["i", "me", "my", "mine", "myself", "name", "job", "role", 
+                        "company", "work", "position", "background"]
+        
+        for term in personal_terms:
+            if term in query.lower() and term not in keywords:
+                keywords.append(term)
+        
+        # Return unique keywords, maintaining original order
+        seen = set()
+        return [x for x in keywords if not (x in seen or seen.add(x))]
     
     @action(detail=False, methods=['get'])
     def history(self, request):
