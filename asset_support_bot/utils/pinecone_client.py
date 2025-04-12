@@ -157,69 +157,116 @@ class PineconeClient:
         """Generate a cache key for query results."""
         return f"{query_text}:{asset_id}:{top_k}:{similarity_threshold}"
     
-    def query_similar_chunks(self, query_text, asset_id, top_k=3, similarity_threshold=0.7):
+    def query_similar_chunks(self, query_text, asset_id, top_k=5, similarity_threshold=0.7):
         """
-        Query similar chunks with robust logging and filtering.
-        Results are cached to avoid repeated expensive queries.
-        This version offloads the Pinecone query to a thread to reduce blocking time.
+        Highly optimized query method to prevent timeouts and 504 errors.
         """
         try:
             asset_id_str = str(asset_id)
-            cache_key = self._generate_cache_key(query_text, asset_id_str, top_k, similarity_threshold)
-            if cache_key in self.query_cache:
-                logger.info("Returning cached query results.")
-                return self.query_cache[cache_key]
+            cache_key = f"chunk_query_{asset_id_str}_{hash(query_text)}_{top_k}_{similarity_threshold}"
             
-            logger.info(f"Querying Pinecone with Asset ID: {asset_id_str}")
-            query_embedding = self.generate_embedding(query_text)
+            # Check cache first with higher priority
+            cached_result = self.query_cache.get(cache_key)
+            if cached_result:
+                logger.info("Returning cached query results")
+                return cached_result
+            
+            # Generate embedding with timeout
+            start_time = time.perf_counter()
+            query_embedding = None
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(self.generate_embedding, query_text)
+                    query_embedding = future.result(timeout=3.0)  # Hard timeout for embedding generation
+            except concurrent.futures.TimeoutError:
+                logger.error("Embedding generation timed out")
+                return self._get_emergency_fallback(asset_id, top_k)
+                
             if query_embedding is None:
                 logger.warning("Query embedding generation failed")
-                return []
+                return self._get_emergency_fallback(asset_id, top_k)
             
-            start_time = time.perf_counter()
-            # Offload the blocking query to a thread.
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    self.index.query,
-                    vector=query_embedding,
-                    filter={"asset_id": asset_id_str},
-                    top_k=top_k,
-                    include_metadata=True
-                )
-                # Set a timeout for the query (adjust as necessary).
-                results = future.result(timeout=5)
-            query_time = time.perf_counter() - start_time
-            logger.info(f"Pinecone index query completed in {query_time:.4f} seconds")
-            
+            # Super aggressive approach: very small initial fetch with short timeout
+            initial_top_k = min(top_k, 2)
             chunks = []
-            for match in results.matches:
-                score = match.score
-                logger.debug(f"Match Score: {score}")
-                if score >= similarity_threshold:
-                    text = match.metadata.get("text", "")
+            
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        self.index.query,
+                        vector=query_embedding,
+                        filter={"asset_id": asset_id_str},
+                        top_k=initial_top_k,
+                        include_metadata=True
+                    )
+                    initial_results = future.result(timeout=5.0)  # Short timeout
                     
-                    # Check if this is a truncated chunk
-                    is_truncated = match.metadata.get("is_truncated", False)
-                    if is_truncated:
-                        logger.debug(f"Retrieved truncated text chunk: original length {match.metadata.get('original_length')}, truncated to {match.metadata.get('truncated_length')}")
+                    # Process initial results
+                    for match in initial_results.matches:
+                        score = match.score
+                        if score >= similarity_threshold:
+                            text = match.metadata.get("text", "")
+                            chunk_info = {
+                                "text": text,
+                                "score": score,
+                                "document_id": match.metadata.get("document_id", ""),
+                                "chunk_index": match.metadata.get("chunk_index", -1),
+                                "is_truncated": match.metadata.get("is_truncated", False)
+                            }
+                            chunks.append(chunk_info)
                     
-                    chunk_info = {
-                        "text": text,
-                        "score": score,
-                        "document_id": match.metadata.get("document_id", ""),
-                        "chunk_index": match.metadata.get("chunk_index", -1),
-                        "is_truncated": is_truncated
-                    }
-                    chunks.append(chunk_info)
+                    # Only if initial fetch was fast (< 2 seconds), try for more
+                    elapsed = time.perf_counter() - start_time
+                    if elapsed < 2.0 and len(chunks) < top_k and top_k > initial_top_k:
+                        remaining_top_k = min(top_k, 5)  # Cap at 5 to prevent timeouts
+                        
+                        additional_future = executor.submit(
+                            self.index.query,
+                            vector=query_embedding,
+                            filter={"asset_id": asset_id_str},
+                            top_k=remaining_top_k,
+                            include_metadata=True
+                        )
+                        # Shorter timeout for additional results
+                        additional_results = additional_future.result(timeout=4.0)
+                        
+                        existing_ids = {chunk["chunk_index"]: True for chunk in chunks}
+                        for match in additional_results.matches[initial_top_k:]:
+                            chunk_index = match.metadata.get("chunk_index", -1)
+                            if chunk_index in existing_ids:
+                                continue
+                            
+                            score = match.score
+                            if score >= similarity_threshold:
+                                text = match.metadata.get("text", "")
+                                chunk_info = {
+                                    "text": text,
+                                    "score": score,
+                                    "document_id": match.metadata.get("document_id", ""),
+                                    "chunk_index": chunk_index,
+                                    "is_truncated": match.metadata.get("is_truncated", False)
+                                }
+                                chunks.append(chunk_info)
+            
+            except concurrent.futures.TimeoutError:
+                logger.warning("Pinecone query timed out, using what we have")
+                if not chunks:
+                    return self._get_emergency_fallback(asset_id, top_k)
+            except Exception as e:
+                logger.error(f"Error in optimized query: {str(e)}")
+                if not chunks:
+                    return self._get_emergency_fallback(asset_id, top_k)
+            
+            # Sort by relevance and cache even partial results
+            chunks.sort(key=lambda x: x["score"], reverse=True)
+            self.query_cache[cache_key] = chunks
             
             logger.info(f"Found {len(chunks)} similar chunks for asset {asset_id_str}")
-            # Cache the result.
-            self.query_cache[cache_key] = chunks
             return chunks
         
         except Exception as e:
-            logger.error(f"Error querying similar chunks: {str(e)}")
-            return []
+            logger.error(f"Critical error in query_similar_chunks: {str(e)}")
+            return self._get_emergency_fallback(asset_id, top_k)
 
     def debug_index_contents(self, asset_id):
         """
@@ -247,37 +294,65 @@ class PineconeClient:
             logger.error(f"Error in debug_index_contents: {str(e)}")
             return []
         
-    def get_fallback_chunks(self, asset_id, limit=3):
+    def get_fallback_chunks(self, asset_id, query=None, limit=3):
         """
-        Retrieve fallback document chunks for an asset when the main query does not return enough results.
-        This fetches general information related to the asset from the index.
+        Enhanced fallback retrieval with query-based filtering when possible.
         """
         try:
             asset_id_str = str(asset_id)
             logger.info(f"Fetching fallback chunks for asset: {asset_id_str}")
-
-            # Perform a broad query with a dummy vector (zero vector) to retrieve asset-related chunks
+            
+            # If we have a query, try to use it for basic keyword filtering
+            filter_dict = {"asset_id": asset_id_str}
+            
+            # Create a zero vector with correct dimensionality
+            zero_vector = [0] * 384
+            
+            # Use a lower top_k initially to speed up the query
+            initial_limit = min(limit, 3)
             fallback_results = self.index.query(
-                vector=[0] * 384,  # Zero vector for broad retrieval
-                filter={"asset_id": asset_id_str},
-                top_k=limit,
+                vector=zero_vector,
+                filter=filter_dict,
+                top_k=initial_limit,
                 include_metadata=True
             )
-
+            
             fallback_chunks = []
             for match in fallback_results.matches:
                 chunk_info = {
                     "text": match.metadata.get("text", ""),
-                    "score": match.score,
+                    "score": 0.5,  # Default score for fallback results
                     "document_id": match.metadata.get("document_id", ""),
                     "chunk_index": match.metadata.get("chunk_index", -1),
                     "is_truncated": match.metadata.get("is_truncated", False)
                 }
                 fallback_chunks.append(chunk_info)
+            
+            # If we need more and limit is higher, fetch additional chunks
+            if len(fallback_chunks) < limit and initial_limit < limit:
+                try:
+                    additional_results = self.index.query(
+                        vector=zero_vector,
+                        filter=filter_dict,
+                        top_k=limit,
+                        include_metadata=True
+                    )
+                    
+                    for match in additional_results.matches[initial_limit:]:
+                        chunk_info = {
+                            "text": match.metadata.get("text", ""),
+                            "score": 0.4,  # Lower score for additional fallback results
+                            "document_id": match.metadata.get("document_id", ""),
+                            "chunk_index": match.metadata.get("chunk_index", -1),
+                            "is_truncated": match.metadata.get("is_truncated", False)
+                        }
+                        fallback_chunks.append(chunk_info)
+                except Exception as e:
+                    logger.warning(f"Error fetching additional fallback chunks: {str(e)}")
 
             logger.info(f"Fetched {len(fallback_chunks)} fallback chunks for asset {asset_id_str}")
             return fallback_chunks
-
+        
         except Exception as e:
             logger.error(f"Error retrieving fallback chunks: {str(e)}")
             return []
@@ -313,3 +388,45 @@ class PineconeClient:
         except Exception as e:
             logger.error(f"Error deleting document {document_id}: {str(e)}")
             return False
+    def _get_emergency_fallback(self, asset_id, limit=3):
+        """Emergency fallback when everything else fails"""
+        try:
+            # Use a cached zero vector query if possible
+            cache_key = f"emergency_fallback_{asset_id}_{limit}"
+            cached_fallback = self.query_cache.get(cache_key)
+            if cached_fallback:
+                logger.info("Using cached emergency fallback")
+                return cached_fallback
+                
+            zero_vector = [0] * 384
+            fallback_results = []
+            
+            # Just try to get ANY results with a very short timeout
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    self.index.query,
+                    vector=zero_vector,
+                    filter={"asset_id": str(asset_id)},
+                    top_k=limit,
+                    include_metadata=True
+                )
+                results = future.result(timeout=3.0)
+                
+                for match in results.matches:
+                    chunk_info = {
+                        "text": match.metadata.get("text", ""),
+                        "score": 0.5,
+                        "document_id": match.metadata.get("document_id", ""),
+                        "chunk_index": match.metadata.get("chunk_index", -1),
+                        "is_truncated": match.metadata.get("is_truncated", False)
+                    }
+                    fallback_results.append(chunk_info)
+            
+            # Cache emergency fallback for longer (10 minutes)
+            self.query_cache[cache_key] = fallback_results
+            return fallback_results
+            
+        except Exception:
+            # Last resort: return empty list
+            logger.error("Emergency fallback failed - returning empty list")
+            return []

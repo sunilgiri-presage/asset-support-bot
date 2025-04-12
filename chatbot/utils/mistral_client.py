@@ -26,11 +26,8 @@ class MistralLLMClient:
             raise ValueError("Mistral API key is required")
 
     def _clean_html(self, html):
-        # Remove newlines and tabs.
         html = re.sub(r'[\n\t]+', ' ', html)
-        # Remove extra spaces between tags.
         html = re.sub(r'>\s+<', '><', html)
-        # Remove spaces at the beginning and end.
         html = html.strip()
 
         # If response already has a container div with our style, return it.
@@ -175,14 +172,8 @@ class MistralLLMClient:
 
     def _get_full_response(self, prompt, outline, context=None, max_length=800):
         domain_expert_instructions = (
-            "You are a domain expert AI assistant specialized in predictive maintenance and asset performance management. "
-            "Provide detailed, technical, and actionable responses based on real‑time IoT sensor data and predictive analytics. "
-            "Include the following elements in your answer:\n"
-            "1. Technical Context: Explain the role of IoT sensors (e.g., vibration, temperature, acoustic) in monitoring machine health.\n"
-            "2. Predictive Analytics: Describe AI algorithms for trend analysis and fault detection.\n"
-            "3. Operational Insights: Offer best practices for predictive maintenance implementation.\n"
-            "4. Actionable Recommendations: Provide step‑by‑step guidance for troubleshooting and sensor optimization.\n"
-            "5. Industry-Specific Considerations: Tailor your answer to reflect unique industry challenges and standards."
+            "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
+            "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
         )
 
         system_content = (
