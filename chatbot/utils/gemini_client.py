@@ -69,7 +69,11 @@ class GeminiLLMClient:
 
     def _clean_html(self, html):
         if not html:
-            return '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;"></div>' # Return empty container if no input
+            return '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;"></div>'  # Return empty container if no input
+
+        # Remove any Markdown code fences if present (e.g., ```html ... ```)
+        html = re.sub(r'^```html\s*', '', html)
+        html = re.sub(r'\s*```$', '', html)
 
         # Remove newlines and tabs.
         html = re.sub(r'[\n\t]+', ' ', html)
@@ -86,18 +90,15 @@ class GeminiLLMClient:
         if container_start_pattern.search(html) and container_end_pattern.search(html):
             # Already has container, ensure style exists or add it
             if 'style=' not in container_start_pattern.search(html).group(0):
-                 html = container_start_pattern.sub(f'<div class="response-container" {style_attr}>', html, count=1)
+                html = container_start_pattern.sub(f'<div class="response-container" {style_attr}>', html, count=1)
             return html
 
-        # Remove any existing top-level response container divs (case-insensitive) if logic failed above or structure is broken
+        # Remove any existing top-level response container divs (if structure is broken)
         html = container_start_pattern.sub('', html).strip()
-        # Remove closing div if it's at the very end (after potentially removing the start)
         if html.endswith('</div>'):
-            # More robust check to avoid removing nested divs' closings
             temp_html = html[:-len('</div>')].strip()
-            # Very basic check: if the remaining doesn't look like it started with a div, assume it was the container end
             if not temp_html.startswith('<div'):
-                 html = temp_html
+                html = temp_html
 
         # Wrap the cleaned content with a styled container div
         html_response = f'<div class="response-container" {style_attr}>{html}</div>'

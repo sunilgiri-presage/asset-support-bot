@@ -21,6 +21,7 @@ from chatbot.utils.gemini_client import GeminiLLMClient
 import requests
 from rest_framework.permissions import AllowAny
 from django.core.cache import cache
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -266,57 +267,43 @@ class ChatbotViewSet(viewsets.ViewSet):
                 "</div>"
             )
         
-        # 1. PREPARE BOTH DOCUMENT AND CONVERSATION CONTEXT IN PARALLEL
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Launch document context retrieval
-            doc_context_future = executor.submit(
-                self._retrieve_document_context, 
-                message_content, 
-                asset_id
-            )
-            
-            # Launch conversation context building in parallel
-            conv_context_future = executor.submit(
-                self._get_cached_or_build_conversation_context,
-                conversation,
-                message_content
-            )
-            
-            # Wait for both with timeouts
-            try:
-                document_context, context_chunks_count = doc_context_future.result(timeout=18.0)
-                # timings['document_context_time'] = f"{document_context.running_time:.2f} seconds"
-            except concurrent.futures.TimeoutError:
-                logger.error("Document context retrieval timed out")
-                document_context = ""
-                context_chunks_count = 0
-                timings['document_context_time'] = "TIMEOUT after 18.0 seconds"
-            
-            try:
-                conversation_context = conv_context_future.result(timeout=5.0)
-                # timings['conversation_context_time'] = f"{conv_context_future.running_time:.2f} seconds"
-            except concurrent.futures.TimeoutError:
-                logger.error("Conversation context building timed out")
-                conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
-                timings['conversation_context_time'] = "TIMEOUT after 5.0 seconds"
+        # --- Updated Parallel Context Retrieval using ThreadPoolExecutor only ---
+        try:
+            with ThreadPoolExecutor() as executor:
+                doc_future = executor.submit(self._retrieve_document_context, message_content, asset_id)
+                conv_future = executor.submit(self._get_cached_or_build_conversation_context, conversation, message_content)
+                
+                try:
+                    document_context, context_chunks_count = doc_future.result(timeout=18.0)
+                    timings['document_context_time'] = "Completed"
+                except TimeoutError:
+                    logger.error("Document context retrieval timed out")
+                    document_context, context_chunks_count = "", 0
+                    timings['document_context_time'] = "TIMEOUT after 18.0 seconds"
+                
+                try:
+                    conversation_context = conv_future.result(timeout=8.0)
+                    timings['conversation_context_time'] = "Completed"
+                except TimeoutError:
+                    logger.error("Conversation context building timed out")
+                    conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+                    timings['conversation_context_time'] = "TIMEOUT after 8.0 seconds"
+        except Exception as e:
+            logger.error("Error during parallel retrieval: %s", str(e))
+            document_context, context_chunks_count = "", 0
+            conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
         
-        # 2. DETERMINE OPTIMAL CONTEXT STRATEGY BASED ON AVAILABLE DATA
-        # If document context failed but conversation context succeeded
+        # --- Determine Optimal Prompt Strategy ---
         if not document_context and conversation_context:
             logger.info("Using conversation-focused context strategy (no document context)")
             prompt_template = "CONVERSATION_FOCUSED"
-            
-        # If we have decent document context
         elif context_chunks_count >= 2:
             logger.info(f"Using document-focused context with {context_chunks_count} chunks")
             prompt_template = "DOCUMENT_FOCUSED"
-            
-        # Fallback to basic strategy
         else:
             logger.info("Using basic context strategy (limited document context)")
             prompt_template = "BASIC"
         
-        # 3. BUILD THE APPROPRIATE PROMPT BASED ON STRATEGY
         combined_prompt = self._build_optimized_prompt(
             prompt_template, 
             message_content, 
@@ -324,47 +311,29 @@ class ChatbotViewSet(viewsets.ViewSet):
             conversation_context
         )
         
-        # 4. SELECT APPROPRIATE LLM AND GENERATE RESPONSE WITH TIMEOUT
+        # --- LLM Response Generation with Timeout ---
         llm_client = self._select_appropriate_llm(document_context, conversation_context)
-        
+        timings['llm_client_used'] = type(llm_client).__name__
         llm_start = time.perf_counter()
         try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
+            with ThreadPoolExecutor() as llm_executor:
+                future = llm_executor.submit(
                     llm_client.generate_response,
                     prompt=message_content,
                     context=combined_prompt
                 )
-                # Set a timeout for LLM response
                 response_content = future.result(timeout=20.0)
-        except concurrent.futures.TimeoutError:
+        except TimeoutError:
             logger.error("LLM response generation timed out after 20 seconds")
             response_content = self._generate_timeout_response(prompt_template, context_chunks_count)
         except Exception as e:
             logger.error(f"Error generating LLM response: {str(e)}")
-            response_content = f"<div class='error-message'>I encountered an error while processing your request: {str(e)}</div>"
-        
+            response_content = (
+                f"<div class='error-message'>I encountered an error while processing your request: {str(e)}</div>"
+            )
         timings['llm_response_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
-        
         return response_content
-
-    # Add this helper method
-    def _build_short_context(self, conversation, max_recent=3):
-        """Build a shorter context for large documents"""
-        messages = list(
-            Message.objects.filter(conversation=conversation).order_by('-created_at')[:max_recent]
-        )
-        messages = sorted(messages, key=lambda x: x.created_at)
-        context_lines = []
-        for msg in messages:
-            prefix = "User:" if msg.is_user else "Assistant:"
-            # Truncate long messages
-            content = msg.content
-            if len(content) > 200:
-                content = content[:200] + "..."
-            context_lines.append(f"{prefix} {content}")
-        return "\n".join(context_lines)
-
+    
     def _handle_fetch_data(self, asset_id, message_content, timings):
         logger.info(f"Handling fetch data request for asset_id: {asset_id}")
         
@@ -427,6 +396,154 @@ class ChatbotViewSet(viewsets.ViewSet):
             timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
             return f"<div class='error-message'>An error occurred while processing data for asset {asset_id}: {str(e)}</div>"
 
+    def _handle_web_search(self, message_content, timings):
+        logger.info(f"Handling web search for query: {message_content}")
+        
+        search_start = time.perf_counter()
+        web_search_results = web_search(message_content)
+        
+        if web_search_results:
+            logger.info("Web search results found")
+            combined_prompt = (
+                f"Web Search Results:\n{web_search_results}\n\n"
+                f"User Query:\n{message_content}\n\n"
+                f"Please provide a comprehensive response to the user's query using the above web search results."
+            )
+        else:
+            logger.info("No web search results found")
+            combined_prompt = (
+                f"User Query:\n{message_content}\n\n"
+                f"No relevant web search results were found. Provide the best response based on your knowledge."
+            )
+        
+        # Use Gemini if web search results are long, otherwise Groq
+        if web_search_results and len(web_search_results.split()) > 100:
+            llm_client = GeminiLLMClient()
+            logger.info("Using GeminiLLMClient for web_search (rich search results).")
+        else:
+            llm_client = GroqLLMClient()
+            logger.info("Using GroqLLMClient for web_search.")
+            
+        response_content = llm_client.generate_response(
+            prompt=message_content,
+            context=combined_prompt
+        )
+        
+        timings['web_search_time'] = f"{time.perf_counter() - search_start:.2f} seconds"
+        return response_content
+    
+    def _handle_conversation_recall(self, message_content, asset_id, conversation, timings):
+        """
+        Handle queries by focusing exclusively on conversation history for the asset.
+        This is optimized for recalling personal information shared by users.
+        """
+        logger.info(f"Handling conversation recall for asset_id: {asset_id}")
+        
+        # Start timing
+        recall_start = time.perf_counter()
+        
+        # 1. First gather current conversation messages
+        current_messages = list(
+            Message.objects.filter(conversation=conversation).order_by('created_at')
+        )
+        
+        # 2. Build the current conversation context with higher message limit
+        current_conversation_context = ""
+        if current_messages:
+            current_conversation_context = self._build_conversation_context(conversation, max_recent=30)
+        
+        # 3. Also find other conversations for this asset to get more context
+        # But only if we need more information
+        all_contexts = [current_conversation_context] if current_conversation_context else []
+        
+        if len(current_messages) < 5:  # Only search other conversations if current one is short
+            logger.info("Current conversation is short, looking for other conversations for this asset")
+            other_conversations = Conversation.objects.filter(
+                asset_id=asset_id
+            ).exclude(
+                id=conversation.id
+            ).order_by('-updated_at')[:3]
+            
+            for other_conv in other_conversations:
+                other_context = self._build_conversation_context(other_conv, max_recent=15)
+                if other_context:
+                    all_contexts.append(f"Previous conversation:\n{other_context}")
+        
+        full_conversation_context = "\n\n".join([ctx for ctx in all_contexts if ctx])
+        
+        # If we have no context at all, handle gracefully
+        if not full_conversation_context:
+            logger.warning("No conversation context found for conversation recall")
+            return (
+                "<div class='response-container'>"
+                "<p>I don't seem to have any previous conversation information about that. "
+                "Could you please provide more details?</p>"
+                "</div>"
+            )
+        
+        # 4. Extract relevant information from the user query to better focus recall
+        query_keywords = self._extract_query_keywords(message_content)
+        logger.info(f"Extracted keywords for conversation recall: {query_keywords}")
+        
+        # 5. Create an optimized prompt specifically for conversation recall with query focus
+        prompt = f"""
+    You are an assistant that recalls information from conversation history.
+    Your ONLY task is to answer based on the conversation history provided below.
+
+    Conversation History:
+    {full_conversation_context}
+
+    Current User Query:
+    {message_content}
+
+    Query Focus Keywords:
+    {', '.join(query_keywords)}
+
+    IMPORTANT INSTRUCTIONS:
+    1. Answer EXCLUSIVELY based on information found in the conversation history above.
+    2. DO NOT use any external knowledge, web information, or made-up details.
+    3. If the conversation history contains the information requested, provide it clearly and concisely.
+    4. If the information is NOT in the conversation history, explicitly state: "I don't have that information in our conversation history."
+    5. Focus especially on personal details the user has shared about themselves or others in the conversation.
+    6. Present your response in a natural, conversational manner.
+    7. Don't mention that you're using "conversation recall" or explain your methodology.
+    """
+
+        # 6. Select appropriate LLM - use MistralLLM for conversation recall
+        llm_client = MistralLLMClient()
+        
+        # 7. Generate response with timeout protection
+        llm_start = time.perf_counter()
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    llm_client.generate_response,
+                    prompt=message_content,
+                    context=prompt
+                )
+                # Set a timeout for LLM response
+                response_content = future.result(timeout=15.0)
+        except concurrent.futures.TimeoutError:
+            logger.error("LLM response generation for conversation recall timed out after 15 seconds")
+            response_content = (
+                "<div class='response-container'>"
+                "<p>I'm having trouble recalling details from our conversation right now. "
+                "Could you please repeat your question or provide more specifics?</p>"
+                "</div>"
+            )
+        except Exception as e:
+            logger.error(f"Error generating LLM response for conversation recall: {str(e)}")
+            response_content = (
+                "<div class='response-container'>"
+                f"<p>I encountered an error while trying to recall our conversation. Please try again with a more specific question.</p>"
+                "</div>"
+            )
+        
+        timings['llm_conversation_recall_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
+        timings['total_conversation_recall_time'] = f"{time.perf_counter() - recall_start:.2f} seconds"
+        
+        return response_content
+    
     def _perform_vibration_analysis(self, data):
         prompt = f"""
 You are a level 3 vibration analyst.
@@ -470,42 +587,6 @@ Instructions:
                 "error": "Failed to parse analysis results",
                 "raw_response": response_text
             }
-
-    def _handle_web_search(self, message_content, timings):
-        logger.info(f"Handling web search for query: {message_content}")
-        
-        search_start = time.perf_counter()
-        web_search_results = web_search(message_content)
-        
-        if web_search_results:
-            logger.info("Web search results found")
-            combined_prompt = (
-                f"Web Search Results:\n{web_search_results}\n\n"
-                f"User Query:\n{message_content}\n\n"
-                f"Please provide a comprehensive response to the user's query using the above web search results."
-            )
-        else:
-            logger.info("No web search results found")
-            combined_prompt = (
-                f"User Query:\n{message_content}\n\n"
-                f"No relevant web search results were found. Provide the best response based on your knowledge."
-            )
-        
-        # Use Gemini if web search results are long, otherwise Groq
-        if web_search_results and len(web_search_results.split()) > 100:
-            llm_client = GeminiLLMClient()
-            logger.info("Using GeminiLLMClient for web_search (rich search results).")
-        else:
-            llm_client = GroqLLMClient()
-            logger.info("Using GroqLLMClient for web_search.")
-            
-        response_content = llm_client.generate_response(
-            prompt=message_content,
-            context=combined_prompt
-        )
-        
-        timings['web_search_time'] = f"{time.perf_counter() - search_start:.2f} seconds"
-        return response_content
 
     def _get_or_create_conversation(self, conversation_id, asset_id):
         # Use cache to avoid repeated DB queries
@@ -799,32 +880,39 @@ Instructions:
         return context
 
     def _build_optimized_prompt(self, template, query, document_context, conversation_context):
-        """Builds optimized prompt based on template and available context"""
+        """Builds an optimized prompt based on template and available context with enhanced instructions
+        to cover all parts of the query, using LLM expertise where context is missing."""
         
         if template == "DOCUMENT_FOCUSED":
-            # When we have good document context, focus primarily on it
+            # When we have rich document context, focus on it but also fill in missing details.
             return (
                 f"Relevant Document Information:\n{document_context}\n\n"
                 f"Previous Messages:\n{conversation_context}\n\n"
                 f"Current User Query: {query}\n\n"
-                "Instructions: Focus primarily on the document information to answer the query."
+                "Instructions: Provide a comprehensive answer that addresses every aspect of the user's question. "
+                "Focus primarily on the document information; however, if some parts of the query are not directly covered in the document, "
+                "use your expertise and logical reasoning to generate a complete answer. Do not simply state that information is missing—instead, infer "
+                "or approximate the details (such as ratings or evaluations) based on context and best practices."
             )
         
         elif template == "CONVERSATION_FOCUSED":
-            # When document context is missing but conversation context is available
+            # When document context is missing but conversation context is available, rely on it and add expert reasoning.
             return (
                 f"Conversation History:\n{conversation_context}\n\n"
                 f"Current User Query: {query}\n\n"
-                "Instructions: Based on the conversation history, provide a helpful response."
+                "Instructions: Based on the conversation history, provide a detailed, helpful, and complete response that covers every part of the query. "
+                "If any information is not found directly in the conversation, use your own expertise and reasoning to infer the best possible answer."
             )
         
         else:  # BASIC
-            # Balanced approach for cases with limited context
+            # A balanced approach when context is limited.
             return (
                 f"Document Information (if available):\n{document_context}\n\n"
                 f"Conversation Context:\n{conversation_context}\n\n"
                 f"Current User Query: {query}\n\n"
-                "Instructions: Provide a concise and helpful response based on available information."
+                "Instructions: Provide a concise yet comprehensive answer that addresses all parts of the query. "
+                "Use the available document and conversation context as a base. Where information is missing, rely on your expertise to infer and generate "
+                "the necessary details. Ensure that the final answer is complete and does not simply mention that certain details are not available."
             )
 
     def _generate_timeout_response(self, template_type, context_chunk_count):
@@ -850,118 +938,6 @@ Instructions:
                 "<p>Please try again with a more specific question or try again shortly.</p>"
                 "</div>"
             )
-        
-    def _handle_conversation_recall(self, message_content, asset_id, conversation, timings):
-        """
-        Handle queries by focusing exclusively on conversation history for the asset.
-        This is optimized for recalling personal information shared by users.
-        """
-        logger.info(f"Handling conversation recall for asset_id: {asset_id}")
-        
-        # Start timing
-        recall_start = time.perf_counter()
-        
-        # 1. First gather current conversation messages
-        current_messages = list(
-            Message.objects.filter(conversation=conversation).order_by('created_at')
-        )
-        
-        # 2. Build the current conversation context with higher message limit
-        current_conversation_context = ""
-        if current_messages:
-            current_conversation_context = self._build_conversation_context(conversation, max_recent=30)
-        
-        # 3. Also find other conversations for this asset to get more context
-        # But only if we need more information
-        all_contexts = [current_conversation_context] if current_conversation_context else []
-        
-        if len(current_messages) < 5:  # Only search other conversations if current one is short
-            logger.info("Current conversation is short, looking for other conversations for this asset")
-            other_conversations = Conversation.objects.filter(
-                asset_id=asset_id
-            ).exclude(
-                id=conversation.id
-            ).order_by('-updated_at')[:3]
-            
-            for other_conv in other_conversations:
-                other_context = self._build_conversation_context(other_conv, max_recent=15)
-                if other_context:
-                    all_contexts.append(f"Previous conversation:\n{other_context}")
-        
-        full_conversation_context = "\n\n".join([ctx for ctx in all_contexts if ctx])
-        
-        # If we have no context at all, handle gracefully
-        if not full_conversation_context:
-            logger.warning("No conversation context found for conversation recall")
-            return (
-                "<div class='response-container'>"
-                "<p>I don't seem to have any previous conversation information about that. "
-                "Could you please provide more details?</p>"
-                "</div>"
-            )
-        
-        # 4. Extract relevant information from the user query to better focus recall
-        query_keywords = self._extract_query_keywords(message_content)
-        logger.info(f"Extracted keywords for conversation recall: {query_keywords}")
-        
-        # 5. Create an optimized prompt specifically for conversation recall with query focus
-        prompt = f"""
-    You are an assistant that recalls information from conversation history.
-    Your ONLY task is to answer based on the conversation history provided below.
-
-    Conversation History:
-    {full_conversation_context}
-
-    Current User Query:
-    {message_content}
-
-    Query Focus Keywords:
-    {', '.join(query_keywords)}
-
-    IMPORTANT INSTRUCTIONS:
-    1. Answer EXCLUSIVELY based on information found in the conversation history above.
-    2. DO NOT use any external knowledge, web information, or made-up details.
-    3. If the conversation history contains the information requested, provide it clearly and concisely.
-    4. If the information is NOT in the conversation history, explicitly state: "I don't have that information in our conversation history."
-    5. Focus especially on personal details the user has shared about themselves or others in the conversation.
-    6. Present your response in a natural, conversational manner.
-    7. Don't mention that you're using "conversation recall" or explain your methodology.
-    """
-
-        # 6. Select appropriate LLM - use MistralLLM for conversation recall
-        llm_client = MistralLLMClient()
-        
-        # 7. Generate response with timeout protection
-        llm_start = time.perf_counter()
-        try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    llm_client.generate_response,
-                    prompt=message_content,
-                    context=prompt
-                )
-                # Set a timeout for LLM response
-                response_content = future.result(timeout=15.0)
-        except concurrent.futures.TimeoutError:
-            logger.error("LLM response generation for conversation recall timed out after 15 seconds")
-            response_content = (
-                "<div class='response-container'>"
-                "<p>I'm having trouble recalling details from our conversation right now. "
-                "Could you please repeat your question or provide more specifics?</p>"
-                "</div>"
-            )
-        except Exception as e:
-            logger.error(f"Error generating LLM response for conversation recall: {str(e)}")
-            response_content = (
-                "<div class='response-container'>"
-                f"<p>I encountered an error while trying to recall our conversation. Please try again with a more specific question.</p>"
-                "</div>"
-            )
-        
-        timings['llm_conversation_recall_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
-        timings['total_conversation_recall_time'] = f"{time.perf_counter() - recall_start:.2f} seconds"
-        
-        return response_content
     
     def _extract_user_information(self, conversation_context):
         """Extract key user information from conversation history to aid in recall"""
