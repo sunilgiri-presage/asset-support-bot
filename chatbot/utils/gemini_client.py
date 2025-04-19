@@ -174,10 +174,10 @@ class GeminiLLMClient:
 
         try:
             # 1. Get Outline (using Gemini)
-            outline_response = self._get_outline(prompt, context)
+            # outline_response = self._get_outline(prompt, context)
 
             # 2. Get Full Response (using Gemini with outline)
-            full_response = self._get_full_response(prompt, outline_response, context, max_length)
+            full_response = self._get_full_response(prompt, context, max_length)
 
             # 3. Clean, Resize Headings, and Validate/Repair HTML (Unchanged logic, applied to Gemini output)
             html_response = self._clean_html(full_response)
@@ -338,7 +338,7 @@ class GeminiLLMClient:
             # Fallback outline if Gemini fails
             return "<h6>Topic Overview</h6><ul><li>Key points</li></ul><h6>Details</h6><ul><li>Important details</li></ul><h6>Conclusion</h6><ul><li>Summary points</li></ul>"
 
-    def _get_full_response(self, prompt, outline, context=None, max_length=800):
+    def _get_full_response(self, prompt,context=None, max_length=800):
         # System instruction specific to generating the FULL RESPONSE, incorporating domain expertise and format requirements.
         domain_expert_instructions = (
             "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
@@ -355,7 +355,6 @@ class GeminiLLMClient:
         if context:
             system_instruction += f"\n\nRelevant Context: {context}\n\nIntegrate this context naturally into your response."
 
-        logger.info("Generating full response from Gemini with outline guidance...")
         try:
             full_response = self._gemini_api_call(
                 system_instruction=system_instruction,

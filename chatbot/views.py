@@ -863,9 +863,29 @@ Instructions:
         message_count = Message.objects.filter(conversation=conversation).count()
         
         if message_count > 15:
-            # For longer conversations, use summarization
+            # For longer conversations, use summarization with limit of 5 summaries
             mistral_client = MistralLLMClient()
-            context = self._build_context_prompt(conversation, mistral_client)
+            
+            # Get the conversation summary and split into individual summaries
+            summary = conversation.summary or ""
+            summaries = summary.split("\n")
+            
+            # Keep only the last 5 summaries if there are more
+            if len(summaries) > 5:
+                limited_summaries = summaries[-5:]  # Take the 5 most recent summaries
+                limited_summary = "\n".join(limited_summaries)
+            else:
+                limited_summary = summary
+                
+            # Get recent conversation as before
+            recent_context = self._build_conversation_context(conversation, max_recent=10)
+            
+            # Combine the limited summary with recent context
+            if limited_summary:
+                context = f"Conversation Summary:\n{limited_summary}\n\nRecent Conversation:\n{recent_context}"
+            else:
+                context = recent_context
+                
         elif message_count > 5:
             # For medium conversations, use simplified context
             context = self._build_minimal_context_prompt(conversation)

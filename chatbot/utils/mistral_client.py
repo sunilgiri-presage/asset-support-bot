@@ -170,26 +170,18 @@ class MistralLLMClient:
                 "<h6>Conclusion</h6><ul><li>Summary points</li></ul>"
             )
 
-    def _get_full_response(self, prompt, outline, context=None, max_length=800):
+    def _get_full_response(self, prompt, context=None, max_length=800):
         domain_expert_instructions = (
             "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
             "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
         )
 
         system_content = (
-            "You are a precise, professional technical support assistant. "
-            f"Follow this outline for your response structure:\n\n{outline}\n\n"
-            "CRITICAL FORMATTING REQUIREMENTS:\n"
-            "1. Format your ENTIRE response as clean HTML with NO markdown.\n"
-            "2. Start with <div class='response-container'> and end with </div>.\n"
-            "3. Use appropriate HTML tags: <p> for paragraphs, <h6> for headings, and <strong> for emphasis.\n"
-            "4. Use proper HTML lists: <ul><li> for bullet points and <ol><li> for numbered lists.\n"
-            "5. For nested lists, place the entire list inside the parent <li> element.\n"
-            "6. Ensure all tags are closed and no sentence is left incomplete.\n"
-            "7. End with a proper conclusion paragraph.\n"
-            "8. Maintain a clear logical structure with a beginning, middle, and end.\n"
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response that strictly follows the outline below. "
+            "Ensure the entire output starts with '<div class=\"response-container\">' and ends with '</div>', uses proper HTML tags (<p>, <h6>, <strong>) and lists (<ul>/<ol>), "
+            "and is entirely valid with all tags closed. The response must be concise, complete all outlined sections with a clear introduction, body, and conclusion, "
+            "and integrate the following domain expertise:\n\n" + domain_expert_instructions
         )
-        system_content += domain_expert_instructions
         if context:
             system_content += f"\n\nRelevant Context: {context}\n\nUse this context to inform your response."
 
@@ -211,7 +203,6 @@ class MistralLLMClient:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logger.info("Generating full response with outline guidance...")
         response = requests.post(
             self.base_url,
             json=payload,
@@ -241,9 +232,9 @@ class MistralLLMClient:
 
         try:
             # Generate outline for the response.
-            outline_response = self._get_outline(prompt, context)
+            # outline_response = self._get_outline(prompt, context)
             # Generate the full response with the outline guidance.
-            full_response = self._get_full_response(prompt, outline_response, context, max_length)
+            full_response = self._get_full_response(prompt, context, max_length)
             # Clean the HTML and resize headings.
             html_response = self._clean_html(full_response)
             html_response = self._resize_headings(html_response)
