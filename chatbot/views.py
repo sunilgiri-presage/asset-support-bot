@@ -146,9 +146,7 @@ class ChatbotViewSet(viewsets.ViewSet):
             elif action_type == "fetch_data":
                 response_content = self._handle_fetch_data(asset_id, message_content, timings)
             elif action_type == "web_search":
-                response_content = self._handle_web_search(message_content, timings)
-            elif action_type == "conversation_recall":
-                response_content = self._handle_conversation_recall(message_content, asset_id, conversation, timings)
+                response_content = self._handle_web_search(message_content, conversation, timings)
             else:
                 logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
                 response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
@@ -203,47 +201,34 @@ class ChatbotViewSet(viewsets.ViewSet):
         mistral_client = MistralLLMClient()
         json_format_str = '{"action": "selected_action"}'
         prompt = f"""
-    You are a smart task routing bot analyzing user queries to determine the most appropriate action to take.
-    Your task is CRITICAL: you must correctly identify when queries should be answered from conversation history rather than external sources.
+                    Analyze the query and return ONLY the appropriate action type as JSON:
 
-    Your available actions are:
+                    1. "document_query": For most questions related to documentation, content understanding, explanations, and general knowledge requests. This is the default handler for most queries that don't explicitly require data retrieval or web search. This also handles questions about personal information previously shared.
+                    Example: "How does this code work?", "Explain machine learning concepts", "What are best practices for API design?", "Tell me about vibration analysis", or "What's my name?" 
 
-    1. "document_query": Use this for questions about technical documentation, API details, or product specifications.
-    2. "fetch_data": Use this for requests about retrieving structured data like stats, metrics, or database information.
-    3. "web_search": Use this when the query needs current information from the internet about general topics, news, or public figures.
-    4. "conversation_recall": MOST IMPORTANTLY, use this whenever:
-    - The query refers to personal information that a user likely shared earlier (names, roles, preferences, characteristics)
-    - The query asks about "me", "my", "I", or "mine" (like "my name", "my job", "my company")
-    - The query references previous conversations or shared details
-    - The query asks about specific people by name who are likely conversation participants, not public figures
-    - The query is checking if the assistant remembers something
-    - The query is following up on previously shared personal information
+                    2. "fetch_data": For requests about asset data, metrics, statistics, or vibration analysis.
+                    Example: "Show me data for asset 12345" or "What's the RPM of my machine?"
 
-    CRITICAL PATTERNS to identify as "conversation_recall":
-    - Queries containing "tell me about [person name]" when that person is likely a conversation participant
-    - Queries asking about someone's name, job, role, company, or personal details
-    - Queries with phrases like "who am I", "what's my name", "where do I work"
-    - Queries that seem to reference personal information previously shared
+                    3. "web_search": ONLY for queries that absolutely require real-time or online information that cannot be answered from stored document context or conversation history.
+                    Example: "What are today's cryptocurrency prices?" or "What were the results of yesterday's election?"
 
-    Remember: Document queries, web searches, and external data will NOT have information about the specific user you're talking to right now. Only conversation history has this.
+                    Instructions:
+                    - Return only a valid JSON object in exactly this format: {json_format_str}
+                    - DO NOT include any explanation or HTML.
+                    - Choose carefully - personal information queries should be handled by document_query.
 
-    Instructions:
-    - Return only a valid JSON object in exactly this format: {json_format_str}
-    - DO NOT include any explanation or HTML.
-    - Choose carefully - routing personal information queries to web_search or document_query will always give incorrect results.
-
-    User Query: "{user_query}"
-    """
+                    User Query: "{user_query}"
+                    """
         try:
             response = mistral_client.generate_response(prompt=prompt, context="")
             logger.info("Action determination response: %s", response)
 
-            match = re.search(r'\{.*?"action"\s*:\s*"(document_query|fetch_data|web_search|conversation_recall)".*?\}', response)
+            match = re.search(r'\{.*?"action"\s*:\s*"(document_query|fetch_data|web_search)".*?\}', response)
             if match:
                 action_json_str = match.group(0)
                 response_json = json.loads(action_json_str)
                 action = response_json.get('action')
-                if action in ["document_query", "fetch_data", "web_search", "conversation_recall"]:
+                if action in ["document_query", "fetch_data", "web_search"]:
                     return action
                 else:
                     logger.warning("Invalid action type received: %s. Defaulting to document_query.", action)
@@ -258,6 +243,7 @@ class ChatbotViewSet(viewsets.ViewSet):
 
     def _handle_document_query(self, message_content, asset_id, conversation, timings):
         logger.info(f"Handling document query: {message_content}")
+        
         if self._check_circuit_breaker():
             timings['circuit_breaker'] = "OPEN - preventing potential timeout"
             return (
@@ -267,33 +253,39 @@ class ChatbotViewSet(viewsets.ViewSet):
                 "</div>"
             )
         
-        # --- Updated Parallel Context Retrieval using ThreadPoolExecutor only ---
         try:
             with ThreadPoolExecutor() as executor:
+                logger.info("Starting parallel context retrieval...")
+
                 doc_future = executor.submit(self._retrieve_document_context, message_content, asset_id)
                 conv_future = executor.submit(self._get_cached_or_build_conversation_context, conversation, message_content)
-                
+
                 try:
                     document_context, context_chunks_count = doc_future.result(timeout=18.0)
+                    logger.info(f"Document context retrieved. Chunks count: {context_chunks_count}")
+                    logger.info(f"Document context content (preview): {document_context[:300]}")
                     timings['document_context_time'] = "Completed"
                 except TimeoutError:
                     logger.error("Document context retrieval timed out")
                     document_context, context_chunks_count = "", 0
                     timings['document_context_time'] = "TIMEOUT after 18.0 seconds"
-                
+
                 try:
                     conversation_context = conv_future.result(timeout=8.0)
+                    logger.info("Conversation context successfully retrieved")
                     timings['conversation_context_time'] = "Completed"
                 except TimeoutError:
                     logger.error("Conversation context building timed out")
                     conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+                    logger.info("Fallback: Built minimal conversation context")
                     timings['conversation_context_time'] = "TIMEOUT after 8.0 seconds"
         except Exception as e:
             logger.error("Error during parallel retrieval: %s", str(e))
             document_context, context_chunks_count = "", 0
             conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
-        
-        # --- Determine Optimal Prompt Strategy ---
+            logger.info("Fallback: Error in context retrieval, using minimal context")
+
+        # Determine Optimal Prompt Strategy
         if not document_context and conversation_context:
             logger.info("Using conversation-focused context strategy (no document context)")
             prompt_template = "CONVERSATION_FOCUSED"
@@ -310,27 +302,38 @@ class ChatbotViewSet(viewsets.ViewSet):
             document_context, 
             conversation_context
         )
-        
-        # --- LLM Response Generation with Timeout ---
+        logger.info(f"Combined prompt built using strategy: {prompt_template}")
+        logger.info(f"Combined prompt content (preview): {combined_prompt[:300]}")
+
+        # LLM Response Generation with Timeout
         llm_client = self._select_appropriate_llm(document_context, conversation_context)
+        logger.info(f"Selected LLM client: {type(llm_client).__name__}")
         timings['llm_client_used'] = type(llm_client).__name__
+
         llm_start = time.perf_counter()
         try:
             with ThreadPoolExecutor() as llm_executor:
+                logger.info("Submitting prompt to LLM...")
                 future = llm_executor.submit(
                     llm_client.generate_response,
                     prompt=message_content,
-                    context=combined_prompt
+                    context=combined_prompt  # Make sure this actually contains the context
                 )
                 response_content = future.result(timeout=20.0)
+                logger.info("LLM response successfully generated")
+                # Log a portion of the response for debugging
+                logger.info(f"LLM response preview: {response_content[:200]}")
         except TimeoutError:
             logger.error("LLM response generation timed out after 20 seconds")
             response_content = self._generate_timeout_response(prompt_template, context_chunks_count)
+            self._record_failure()  # Record this failure for circuit breaker
         except Exception as e:
             logger.error(f"Error generating LLM response: {str(e)}")
             response_content = (
                 f"<div class='error-message'>I encountered an error while processing your request: {str(e)}</div>"
             )
+            self._record_failure()  # Record this failure for circuit breaker
+        
         timings['llm_response_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
         return response_content
     
@@ -396,8 +399,23 @@ class ChatbotViewSet(viewsets.ViewSet):
             timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
             return f"<div class='error-message'>An error occurred while processing data for asset {asset_id}: {str(e)}</div>"
 
-    def _handle_web_search(self, message_content, timings):
+    def _handle_web_search(self, message_content, conversation, timings):
         logger.info(f"Handling web search for query: {message_content}")
+
+        try:
+            with ThreadPoolExecutor() as executor:
+                conv_future = executor.submit(self._get_cached_or_build_conversation_context, conversation, message_content)
+                
+                try:
+                    conversation_context = conv_future.result(timeout=8.0)
+                    timings['conversation_context_time'] = "Completed"
+                except TimeoutError:
+                    logger.error("Conversation context building timed out")
+                    conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+                    timings['conversation_context_time'] = "TIMEOUT after 8.0 seconds"
+        except Exception as e:
+            logger.error("Error during parallel retrieval: %s", str(e))
+            conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
         
         search_start = time.perf_counter()
         web_search_results = web_search(message_content)
@@ -407,12 +425,14 @@ class ChatbotViewSet(viewsets.ViewSet):
             combined_prompt = (
                 f"Web Search Results:\n{web_search_results}\n\n"
                 f"User Query:\n{message_content}\n\n"
+                f"Conversation Context:\n{conversation_context}\n\n"
                 f"Please provide a comprehensive response to the user's query using the above web search results."
             )
         else:
             logger.info("No web search results found")
             combined_prompt = (
                 f"User Query:\n{message_content}\n\n"
+                f"Conversation Context:\n{conversation_context}\n\n"
                 f"No relevant web search results were found. Provide the best response based on your knowledge."
             )
         
@@ -431,119 +451,7 @@ class ChatbotViewSet(viewsets.ViewSet):
         
         timings['web_search_time'] = f"{time.perf_counter() - search_start:.2f} seconds"
         return response_content
-    
-    def _handle_conversation_recall(self, message_content, asset_id, conversation, timings):
-        """
-        Handle queries by focusing exclusively on conversation history for the asset.
-        This is optimized for recalling personal information shared by users.
-        """
-        logger.info(f"Handling conversation recall for asset_id: {asset_id}")
-        
-        # Start timing
-        recall_start = time.perf_counter()
-        
-        # 1. First gather current conversation messages
-        current_messages = list(
-            Message.objects.filter(conversation=conversation).order_by('created_at')
-        )
-        
-        # 2. Build the current conversation context with higher message limit
-        current_conversation_context = ""
-        if current_messages:
-            current_conversation_context = self._build_conversation_context(conversation, max_recent=30)
-        
-        # 3. Also find other conversations for this asset to get more context
-        # But only if we need more information
-        all_contexts = [current_conversation_context] if current_conversation_context else []
-        
-        if len(current_messages) < 5:  # Only search other conversations if current one is short
-            logger.info("Current conversation is short, looking for other conversations for this asset")
-            other_conversations = Conversation.objects.filter(
-                asset_id=asset_id
-            ).exclude(
-                id=conversation.id
-            ).order_by('-updated_at')[:3]
-            
-            for other_conv in other_conversations:
-                other_context = self._build_conversation_context(other_conv, max_recent=15)
-                if other_context:
-                    all_contexts.append(f"Previous conversation:\n{other_context}")
-        
-        full_conversation_context = "\n\n".join([ctx for ctx in all_contexts if ctx])
-        
-        # If we have no context at all, handle gracefully
-        if not full_conversation_context:
-            logger.warning("No conversation context found for conversation recall")
-            return (
-                "<div class='response-container'>"
-                "<p>I don't seem to have any previous conversation information about that. "
-                "Could you please provide more details?</p>"
-                "</div>"
-            )
-        
-        # 4. Extract relevant information from the user query to better focus recall
-        query_keywords = self._extract_query_keywords(message_content)
-        logger.info(f"Extracted keywords for conversation recall: {query_keywords}")
-        
-        # 5. Create an optimized prompt specifically for conversation recall with query focus
-        prompt = f"""
-    You are an assistant that recalls information from conversation history.
-    Your ONLY task is to answer based on the conversation history provided below.
 
-    Conversation History:
-    {full_conversation_context}
-
-    Current User Query:
-    {message_content}
-
-    Query Focus Keywords:
-    {', '.join(query_keywords)}
-
-    IMPORTANT INSTRUCTIONS:
-    1. Answer EXCLUSIVELY based on information found in the conversation history above.
-    2. DO NOT use any external knowledge, web information, or made-up details.
-    3. If the conversation history contains the information requested, provide it clearly and concisely.
-    4. If the information is NOT in the conversation history, explicitly state: "I don't have that information in our conversation history."
-    5. Focus especially on personal details the user has shared about themselves or others in the conversation.
-    6. Present your response in a natural, conversational manner.
-    7. Don't mention that you're using "conversation recall" or explain your methodology.
-    """
-
-        # 6. Select appropriate LLM - use MistralLLM for conversation recall
-        llm_client = MistralLLMClient()
-        
-        # 7. Generate response with timeout protection
-        llm_start = time.perf_counter()
-        try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    llm_client.generate_response,
-                    prompt=message_content,
-                    context=prompt
-                )
-                # Set a timeout for LLM response
-                response_content = future.result(timeout=15.0)
-        except concurrent.futures.TimeoutError:
-            logger.error("LLM response generation for conversation recall timed out after 15 seconds")
-            response_content = (
-                "<div class='response-container'>"
-                "<p>I'm having trouble recalling details from our conversation right now. "
-                "Could you please repeat your question or provide more specifics?</p>"
-                "</div>"
-            )
-        except Exception as e:
-            logger.error(f"Error generating LLM response for conversation recall: {str(e)}")
-            response_content = (
-                "<div class='response-container'>"
-                f"<p>I encountered an error while trying to recall our conversation. Please try again with a more specific question.</p>"
-                "</div>"
-            )
-        
-        timings['llm_conversation_recall_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
-        timings['total_conversation_recall_time'] = f"{time.perf_counter() - recall_start:.2f} seconds"
-        
-        return response_content
-    
     def _perform_vibration_analysis(self, data):
         prompt = f"""
 You are a level 3 vibration analyst.
@@ -675,6 +583,7 @@ Instructions:
         
         # If we have at least some results, return them even if less than requested
         if context_chunks:
+            logger.info(f"Context chunks: {context_chunks}")
             logger.info(f"Retrieved total of {len(context_chunks)} context chunks via vector search")
             # Cache results with a TTL based on result count (more results = longer cache)
             cache_ttl = min(300 + (len(context_chunks) * 60), 1800)  # Between 5-30 minutes
@@ -822,34 +731,159 @@ Instructions:
             logger.info(f"Using GroqLLMClient (context size: {total_chars} chars)")
             return GroqLLMClient()
         
-    def _retrieve_document_context(self, query, asset_id):
-        """Retrieves document context with timing and returns both the context and chunk count"""
+    def _retrieve_document_context(self, query, asset_id, max_tokens=2500):
+        """Retrieves high-quality document context with adaptive retrieval strategies"""
         context_start = time.perf_counter()
         context_chunks = []
         
         try:
             if pinecone_client is not None:
-                # Use optimized context retrieval method
-                top_k = 5  # Start with reasonable default
-                context_chunks = self._retrieve_context_chunks(query, asset_id, top_k)
+                # Step 1: Generate a better search query by extracting key terms
+                enriched_query = self._enhance_search_query(query)
+                logger.info(f"Enhanced query: {enriched_query}")
                 
-                # If we got less than 2 chunks, try with a lower similarity threshold
+                # Step 2: First attempt with stricter relevance threshold
+                top_k = 3  # Start with fewer chunks but higher quality
+                context_chunks = self._retrieve_context_chunks(
+                    enriched_query, asset_id, top_k, similarity_threshold=0.75
+                )
+                
+                # Step 3: Adaptive retrieval based on initial results
                 if len(context_chunks) < 2:
                     logger.info("First retrieval got insufficient chunks, trying with lower threshold")
+                    # Try with lower threshold but still limit results
                     context_chunks = self._retrieve_context_chunks(
-                        query, asset_id, top_k, similarity_threshold=0.6
+                        enriched_query, asset_id, 4, similarity_threshold=0.65
                     )
+                    
+                    # If still insufficient, try with original query as fallback
+                    if len(context_chunks) < 2:
+                        logger.info("Second retrieval still insufficient, using original query")
+                        context_chunks = self._retrieve_context_chunks(
+                            query, asset_id, 5, similarity_threshold=0.6
+                        )
             else:
                 logger.error("PineconeClient initialization failed")
         except Exception as e:
             logger.error(f"Error during context retrieval: {str(e)}")
+            # Return empty to avoid further errors
+            return "", 0
         
-        document_context = self._format_context(context_chunks)
+        # Format context based on the type of chunks we have
+        document_context = self._format_context_safe(context_chunks)
+        logger.info(f"Formatted document context: {document_context[:100]}...")  # Log only first 100 chars
         
-        # Add runtime as property
+        # Log metrics
         running_time = time.perf_counter() - context_start
+        logger.info(f"Retrieved {len(context_chunks)} chunks in {running_time:.2f}s")
         
         return document_context, len(context_chunks)
+
+    def _format_context_safe(self, chunks):
+        """Format chunks safely handling both object and dictionary types"""
+        if not chunks:
+            return ""
+        
+        formatted_sections = []
+        
+        for i, chunk in enumerate(chunks):
+            # Handle both object and dictionary types
+            if isinstance(chunk, dict):
+                # For dictionary chunks
+                content = chunk.get('text', '')  # Changed from 'content' to 'text' to match actual data structure
+                section_name = chunk.get('section_name', f"Section {i+1}")
+                score = chunk.get('score', None)
+            else:
+                # For object chunks
+                content = getattr(chunk, 'text', '') if hasattr(chunk, 'text') else getattr(chunk, 'content', '')
+                section_name = getattr(chunk, 'section_name', f"Section {i+1}")
+                score = getattr(chunk, 'score', None)
+            
+            # Add section header with relevance indicator
+            relevance_str = f" (Relevance: {score:.2f})" if score is not None else ""
+            section_header = f"[{section_name}{relevance_str}]"
+            
+            # Make sure to include the actual content, not placeholder
+            formatted_sections.append(f"{section_header}\n{content}")
+        
+        return "\n\n".join(formatted_sections)
+
+    def _enhance_search_query(self, query):
+        """Extract key terms to create a more focused search query"""
+        # Simple implementation - extract nouns and technical terms
+        words = query.split()
+        if len(words) > 8:
+            # For longer queries, extract key terms
+            import re
+            # Keep technical terms, function names, and important nouns
+            tech_pattern = r'\b[a-zA-Z_]+\(.*?\)|\b[a-zA-Z_]+\b|[a-zA-Z_]+_[a-zA-Z_]+'
+            tech_terms = re.findall(tech_pattern, query)
+            return " ".join(tech_terms if tech_terms else words[:8])
+        return query
+
+    def _deduplicate_chunks(self, chunks):
+        """Remove redundant chunks with high text overlap"""
+        if not chunks:
+            return []
+        
+        unique_chunks = [chunks[0]]
+        for chunk in chunks[1:]:
+            # Check if this chunk is too similar to existing ones
+            is_duplicate = False
+            for existing in unique_chunks:
+                similarity = self._text_similarity(chunk.content, existing.content)
+                if similarity > 0.7:  # 70% content overlap threshold
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                unique_chunks.append(chunk)
+        
+        return unique_chunks
+
+    def _text_similarity(self, text1, text2):
+        """Calculate simple text similarity ratio"""
+        # Simple implementation - can be improved with better algorithms
+        common_words = set(text1.lower().split()) & set(text2.lower().split())
+        all_words = set(text1.lower().split()) | set(text2.lower().split())
+        return len(common_words) / len(all_words) if all_words else 0
+
+    def _limit_chunks_by_tokens(self, chunks, max_tokens):
+        """Limit chunks to stay within token budget"""
+        result = []
+        token_count = 0
+        
+        for chunk in chunks:
+            chunk_tokens = len(chunk.content.split())
+            if token_count + chunk_tokens > max_tokens:
+                break
+            
+            result.append(chunk)
+            token_count += chunk_tokens
+        
+        return result
+
+    def _format_context_enhanced(self, chunks):
+        """Format chunks with better structure and relevance indicators"""
+        if not chunks:
+            return ""
+        
+        formatted_sections = []
+        
+        # Sort chunks by relevance score if available
+        chunks.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
+        
+        for i, chunk in enumerate(chunks):
+            # Add section header with relevance indicator
+            relevance = getattr(chunk, 'score', None)
+            relevance_str = f" (Relevance: {relevance:.2f})" if relevance is not None else ""
+            
+            section_name = getattr(chunk, 'section_name', f"Section {i+1}")
+            section_header = f"[{section_name}{relevance_str}]"
+            
+            formatted_sections.append(f"{section_header}\n{chunk.content}")
+        
+        return "\n\n".join(formatted_sections)
 
     def _get_cached_or_build_conversation_context(self, conversation, current_query):
         """Gets conversation context from cache or builds it if not available"""
@@ -902,6 +936,11 @@ Instructions:
     def _build_optimized_prompt(self, template, query, document_context, conversation_context):
         """Builds an optimized prompt based on template and available context with enhanced instructions
         to cover all parts of the query, using LLM expertise where context is missing."""
+        
+        # First, verify we actually have context to use
+        if not document_context or document_context.strip() == "":
+            logger.warning("Document context is empty or contains only section headers")
+            document_context = "No relevant document context available."
         
         if template == "DOCUMENT_FOCUSED":
             # When we have rich document context, focus on it but also fill in missing details.

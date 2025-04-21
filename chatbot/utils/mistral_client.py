@@ -217,6 +217,7 @@ class MistralLLMClient:
 
     def generate_response(self, prompt, context=None, max_length=800):
         overall_start = time.perf_counter()
+        logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context)} chars")
 
         # Check for basic greetings and return a hardcoded response if applicable.
         basic_greetings = {"hi", "hii", "hello", "hey", "hlo", "h", "hh", "hiii", "helloo", "helo", "hilo", "hellooo"}
