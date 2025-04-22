@@ -96,15 +96,34 @@ class ChatbotViewSet(viewsets.ViewSet):
                 content=message_content
             )
             timings['user_message_time'] = f"{time.perf_counter() - user_msg_start:.2f} seconds"
-
-            # Check if the incoming message is a basic greeting
             basic_greetings = {"hi", "hii", "hello", "hey", "hlo", "h", "hh", "hiii", "helloo", "helo", "hilo", "hellooo"}
-            if message_content.strip().lower() in basic_greetings:
+            gratitude_keywords = {"thank", "thanks", "thank you", "thankyou", "tq", "tqs"}
+            # 2. Normalize incoming message
+            content = message_content.strip().lower()
+            # 3. Check for greetings
+            if content in basic_greetings:
                 hardcoded_response = (
                     '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
-                    '<p>Hello! How can I help you today with Presage Insights? I can assist with predictive maintenance, IoT sensor data, or analytics questions.</p>'
+                    '<p>Hello! How can I help you today with Presage Insights? I can assist with predictive maintenance, '
+                    'IoT sensor data, or analytics questions.</p>'
                     '</div>'
                 )
+                is_hardcoded = True
+
+            # 4. Check for thanks/gratitude
+            elif content in gratitude_keywords:
+                hardcoded_response = (
+                    '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                    '<p>You’re very welcome! If there’s anything else you need, just let me know.</p>'
+                    '</div>'
+                )
+                is_hardcoded = True
+
+            else:
+                is_hardcoded = False
+
+            # 5. If we matched one of the hard‐coded cases, return immediately
+            if is_hardcoded:
                 system_message = Message.objects.create(
                     conversation=conversation,
                     is_user=False,
