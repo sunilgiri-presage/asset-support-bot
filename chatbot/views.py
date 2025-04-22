@@ -167,7 +167,7 @@ class ChatbotViewSet(viewsets.ViewSet):
             elif action_type == "fetch_data":
                 response_content = self._handle_fetch_data(asset_id, message_content, timings)
             elif action_type == "web_search":
-                response_content = self._handle_web_search(message_content, conversation, timings)
+                response_content = self._handle_web_search(message_content, timings)
             else:
                 logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
                 response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
@@ -454,96 +454,112 @@ class ChatbotViewSet(viewsets.ViewSet):
             timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
             return f"<div class='error-message'>An error occurred while processing data for asset {asset_id}: {str(e)}</div>"
 
-    def _handle_web_search(self, message_content, conversation, timings):
+    def _handle_web_search(self, message_content, timings):
         logger.info(f"Handling web search for query: {message_content}")
-
+        
         try:
-            with ThreadPoolExecutor() as executor:
-                conv_future = executor.submit(self._get_cached_or_build_conversation_context, conversation, message_content)
-                
-                try:
-                    conversation_context = conv_future.result(timeout=8.0)
-                    timings['conversation_context_time'] = "Completed"
-                except TimeoutError:
-                    logger.error("Conversation context building timed out")
-                    conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
-                    timings['conversation_context_time'] = "TIMEOUT after 8.0 seconds"
-        except Exception as e:
-            logger.error("Error during parallel retrieval: %s", str(e))
-            conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
-        
-        search_start = time.perf_counter()
-        web_search_results = web_search(message_content)
-        search_time = time.perf_counter() - search_start
-        timings['web_search_time'] = f"{search_time:.2f} seconds"
-        
-        # Log actual search results content for debugging
-        logger.info(f"Web search results content preview: {web_search_results[:200]}...")
-        
-        if web_search_results:
-            logger.info("Web search results found")
+            # Get conversation context with better timeout handling
+            # try:
+            #     conv_start = time.perf_counter()
+            #     conversation_context = self._get_cached_or_build_conversation_context(conversation, message_content)
+            #     timings['conversation_context_time'] = f"{time.perf_counter() - conv_start:.2f} seconds"
+            # except Exception as e:
+            #     logger.error(f"Error building conversation context: {str(e)}")
+            #     conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+            #     timings['conversation_context_time'] = "Error - using minimal context"
             
-            # Create a more direct prompt that emphasizes using the search results
-            combined_prompt = (
-                f"USER QUERY: {message_content}\n\n"
-                f"WEB SEARCH RESULTS:\n{web_search_results}\n\n"
-                f"CONVERSATION CONTEXT:\n{conversation_context}\n\n"
-                "INSTRUCTIONS: Use the web search results above to directly answer the user's query. "
-                "If the search results contain relevant information about the query, synthesize and present that information clearly. "
-                "If the search results do not contain information relevant to the query, state specifically what was missing and "
-                "that you cannot answer based on the provided search results."
-            )
-        else:
-            logger.info("No web search results found")
-            combined_prompt = (
-                f"USER QUERY: {message_content}\n\n"
-                f"CONVERSATION CONTEXT: {conversation_context}\n\n"
-                "INSTRUCTIONS: No relevant web search results were found. "
-                "Inform the user that you could not find information related to their query."
-            )
-        
-        # Log the complete prompt being sent to the LLM
-        logger.debug(f"Complete prompt for LLM: {combined_prompt}")
-        
-        # Use Gemini if web search results are long, otherwise Groq
-        if web_search_results and len(web_search_results.split()) > 100:
-            llm_client = GeminiLLMClient()
-            logger.info("Using GeminiLLMClient for web_search (rich search results).")
-        else:
-            llm_client = GroqLLMClient()
-            logger.info("Using GroqLLMClient for web_search.")
-        
-        # Modify the way we call the LLM
-        if isinstance(llm_client, GeminiLLMClient):
-            # Directly call the query method for better control
-            system_prompt = (
-                "You are a helpful assistant for Presage Insights. Answer the user's query using the provided web search results. "
-                "Focus on extracting and synthesizing relevant information from the search results. "
-                "Format your response with proper HTML, including a div with class 'response-container' and appropriate styling. "
-                "If the search results don't contain information needed to answer the query, explain this clearly."
-            )
+            # Execute web search
+            search_start = time.perf_counter()
+            web_search_results = web_search(message_content)
+            search_time = time.perf_counter() - search_start
+            timings['web_search_time'] = f"{search_time:.2f} seconds"
+            
+            # Extract text content from HTML for better processing
+            search_text = self._extract_text_from_html(web_search_results)
+            logger.info(f"Web search results text preview: {search_text[:150]}...")
+            
+            if search_text.strip():
+                logger.info("Web search results found")
+                
+                # Create a better structured prompt for the LLM
+                system_instruction = (
+                        "You are Presage Insights' intelligent assistant. Your task is to answer the user's query "
+                        "using the provided web search results. **Do not** emit any Markdown code fences (```), "
+                        "only raw HTML. Use `<h5>` for all section or question titles, `<p>` for paragraphs, "
+                        "and wrap your full answer in a `<div class='response-container'>`.\n\n"
+                        "1. Pull facts directly from the search-html provided.\n"
+                        "2. Cite your source inline (e.g. “(Source: BBC News)”).\n"
+                        "3. If no relevant info, state that politely and suggest alternate phrasing.\n"
+                        "4. Keep styling minimal—headings in `<h5>`, body text in `<p>`."
+                )
+                
+                user_prompt = (
+                    f"USER QUERY: {message_content}\n\n"
+                    f"WEB SEARCH RESULTS:\n{search_text}\n\n"
+                    # f"CONVERSATION CONTEXT:\n{conversation_context}\n\n"
+                    "Please provide a comprehensive answer to the user's query based on the search results."
+                )
+            else:
+                logger.info("No web search results found")
+                
+                system_instruction = (
+                    "You are Presage Insights' intelligent assistant. The web search returned no results for "
+                    "the user's query. Inform the user politely while offering alternative suggestions."
+                )
+                
+                user_prompt = (
+                    f"USER QUERY: {message_content}\n\n"
+                    # f"CONVERSATION CONTEXT: {conversation_context}\n\n"
+                    "No relevant web search results were found. Please inform the user and suggest alternatives."
+                )
+            
+            # Choose LLM based on query complexity, not just result length
+            # Categorize the query to determine the best model
+            query_complexity = self._assess_query_complexity(message_content)
+            
+            if query_complexity == "high" or (web_search_results and len(web_search_results) > 500):
+                llm_client = GeminiLLMClient()
+                logger.info("Using GeminiLLMClient for web_search (complex query or rich results)")
+            else:
+                llm_client = GroqLLMClient()
+                logger.info("Using GroqLLMClient for web_search (simple query)")
+            
+            # Construct messages in a consistent chat format
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": combined_prompt}
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_prompt}
             ]
             
-            response_content = llm_client.query_llm(
-                messages=messages,
-                temperature=0.7,
-                max_tokens=800
-            )
+            # Get response from LLM
+            if isinstance(llm_client, GeminiLLMClient):
+                response_content = llm_client.query_llm(
+                    messages=messages,
+                    temperature=0.5,  # Lower temperature for more factual responses
+                    max_tokens=1200    # Increased token limit for comprehensive answers
+                )
+            else:
+                # For Groq, adapt the format as needed
+                combined_prompt = f"{system_instruction}\n\n{user_prompt}"
+                response_content = llm_client.generate_response(
+                    prompt=message_content,
+                    context=combined_prompt
+                )
             
             # Ensure proper HTML formatting
             if not response_content.strip().startswith('<div class="response-container"'):
                 response_content = f'<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">{response_content}</div>'
-        else:
-            # Use the standard method for other LLM clients
-            response_content = llm_client.generate_response(
-                prompt=message_content,
-                context=combined_prompt
+            
+            return response_content
+            
+        except Exception as e:
+            logger.error(f"Error in web search handling: {str(e)}")
+            error_response = (
+                '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p>I apologize, but I encountered an error while searching for information on your query. '
+                'Please try rephrasing your question or asking something else.</p>'
+                '</div>'
             )
-        
-        return response_content
+            return error_response
 
     def _perform_vibration_analysis(self, data):
         prompt = f"""
@@ -1206,6 +1222,41 @@ Instructions:
     Please provide a helpful response using your general knowledge:
     """
         return prompt
+    
+    def _extract_text_from_html(self, html_content):
+        """Extract plain text from HTML search results for better LLM processing"""
+        if not html_content:
+            return ""
+        
+        # Simple regex-based extraction (you could use BeautifulSoup for more robust parsing)
+        # Remove HTML tags but preserve important text
+        text = re.sub(r'<[^>]*>', ' ', html_content)
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+
+    def _assess_query_complexity(self, query):
+        """Assess query complexity to determine the best LLM to use"""
+        # Check for indicators of complex queries
+        complex_indicators = [
+            # Multiple questions or multi-part query
+            '?' in query and query.count('?') > 1,
+            
+            # Long query (more than 15 words)
+            len(query.split()) > 15,
+            
+            # Specific technical terms
+            any(term in query.lower() for term in [
+                'compare', 'contrast', 'analyze', 'explain', 'technical', 
+                'detailed', 'comprehensive', 'in-depth'
+            ]),
+            
+            # Requires synthesis of multiple concepts
+            ';' in query or ' and ' in query or ' versus ' in query or ' vs ' in query
+        ]
+        
+        return "high" if any(complex_indicators) else "normal"
     
     @action(detail=False, methods=['get'])
     def history(self, request):

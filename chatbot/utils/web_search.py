@@ -492,7 +492,7 @@ def format_results_as_html(results, is_time_sensitive):
             '</div>'
         )
     
-    html += "<h3>Web Search Results</h3><ul style='padding-left: 20px; margin-top: 10px;'>"
+    html += "<h5>Web Search Results</h5><ul style='padding-left: 20px; margin-top: 10px;'>"
 
     for res in results:
         title = res.get('title', 'Result')
