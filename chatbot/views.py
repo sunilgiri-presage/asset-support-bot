@@ -22,6 +22,8 @@ import requests
 from rest_framework.permissions import AllowAny
 from django.core.cache import cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from django.db.models import Max, Prefetch
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -1173,100 +1175,153 @@ Instructions:
         asset_id = request.query_params.get('asset_id')
         cache_timeout = 60
         
-        if conversation_id:
-            cache_key = f"chat_history_conversation_{conversation_id}"
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                return Response(cached_data)
-            
-            conversation = get_object_or_404(Conversation, id=conversation_id)
-            messages = Message.objects.filter(conversation=conversation).order_by('created_at')
-            message_pairs = []
+        # Create a message pairs utility function to avoid duplication
+        def create_message_pairs(messages, conversation):
+            pairs = []
             user_message = None
-
-            for message in messages:
-                if message.is_user:
+            
+            for msg in messages:
+                if msg.is_user:
                     if user_message:
-                        message_pairs.append({
+                        pairs.append({
                             'conversation': conversation,
                             'user_message': user_message,
-                            'system_message': None
+                            'system_message': None,
                         })
-                    user_message = message
+                    user_message = msg
                 else:
                     if user_message:
-                        message_pairs.append({
+                        pairs.append({
                             'conversation': conversation,
                             'user_message': user_message,
-                            'system_message': message
+                            'system_message': msg,
                         })
                         user_message = None
                     else:
-                        message_pairs.append({
+                        pairs.append({
                             'conversation': conversation,
                             'user_message': None,
-                            'system_message': message
+                            'system_message': msg,
                         })
+            
             if user_message:
-                message_pairs.append({
+                pairs.append({
                     'conversation': conversation,
                     'user_message': user_message,
-                    'system_message': None
+                    'system_message': None,
                 })
+                
+            return pairs
 
-            serializer = MessagePairSerializer(message_pairs, many=True)
-            response_data = serializer.data
-            cache.set(cache_key, response_data, timeout=cache_timeout)
-            return Response(response_data)
+        # only fetch the fields we actually use
+        message_qs = Message.objects.only('id', 'is_user', 'content', 'created_at')
+
+        if conversation_id:
+            cache_key = f"chat_history_conversation_{conversation_id}"
+            
+            # Try to get from cache first
+            cached = cache.get(cache_key)
+            
+            # Check if we should invalidate cache - get latest message timestamp
+            if cached:
+                conversation = get_object_or_404(Conversation, id=conversation_id)
+                latest_message = message_qs.filter(conversation=conversation).order_by('-created_at').first()
+                
+                # If there's no latest message in the DB or cached data is empty, invalidate
+                if not latest_message or not cached:
+                    cached = None
+                else:
+                    # Check if our cached data includes all messages by comparing counts
+                    msg_count = message_qs.filter(conversation=conversation).count()
+                    
+                    # Calculate message count in cached data
+                    cached_msg_count = sum(1 for pair in cached if pair.get('user_message')) + \
+                                      sum(1 for pair in cached if pair.get('system_message'))
+                    
+                    if cached_msg_count != msg_count:
+                        cached = None
+
+            if not cached:
+                conversation = get_object_or_404(Conversation, id=conversation_id)
+                messages = message_qs.filter(conversation=conversation).order_by('created_at')
+                
+                message_pairs = create_message_pairs(messages, conversation)
+                
+                serializer = MessagePairSerializer(message_pairs, many=True)
+                data = serializer.data
+                cache.set(cache_key, data, timeout=cache_timeout)
+                return Response(data)
+            
+            return Response(cached)
 
         elif asset_id:
             cache_key = f"chat_history_asset_{asset_id}"
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                return Response(cached_data)
             
-            conversations = Conversation.objects.filter(asset_id=asset_id).order_by('-updated_at')
-            all_message_pairs = []
-            for conversation in conversations:
-                messages = Message.objects.filter(conversation=conversation).order_by('created_at')
-                user_message = None
-                for message in messages:
-                    if message.is_user:
-                        if user_message:
-                            all_message_pairs.append({
-                                'conversation': conversation,
-                                'user_message': user_message,
-                                'system_message': None
-                            })
-                        user_message = message
-                    else:
-                        if user_message:
-                            all_message_pairs.append({
-                                'conversation': conversation,
-                                'user_message': user_message,
-                                'system_message': message
-                            })
-                            user_message = None
-                        else:
-                            all_message_pairs.append({
-                                'conversation': conversation,
-                                'user_message': None,
-                                'system_message': message
-                            })
-                if user_message:
-                    all_message_pairs.append({
-                        'conversation': conversation,
-                        'user_message': user_message,
-                        'system_message': None
-                    })
+            # Try to get from cache first
+            cached = cache.get(cache_key)
             
-            serializer = MessagePairSerializer(all_message_pairs, many=True)
-            response_data = serializer.data
-            cache.set(cache_key, response_data, timeout=cache_timeout)
-            return Response(response_data)
-
+            # Check if we should invalidate cache
+            if cached:
+                # Get all conversations for this asset
+                conversations = Conversation.objects.filter(asset_id=asset_id)
+                
+                if not conversations.exists() or not cached:
+                    cached = None
+                else:
+                    # Get the latest update time across all conversations
+                    latest_update = conversations.aggregate(Max('updated_at'))['updated_at__max']
+                    
+                    # Check if we have new conversations or messages since the cache was created
+                    cache_created_time = cache.get(f"{cache_key}_created_at")
+                    
+                    if not cache_created_time or latest_update and latest_update > cache_created_time:
+                        cached = None
+            
+            if not cached:
+                conversations = (
+                    Conversation.objects
+                    .filter(asset_id=asset_id)
+                    .order_by('-updated_at')
+                    .prefetch_related(
+                        Prefetch(
+                            'messages',
+                            queryset=message_qs.order_by('created_at'),
+                            to_attr='ordered_messages'
+                        )
+                    )
+                )
+                
+                all_message_pairs = []
+                for conv in conversations:
+                    conv_pairs = create_message_pairs(conv.ordered_messages, conv)
+                    all_message_pairs.extend(conv_pairs)
+                
+                serializer = MessagePairSerializer(all_message_pairs, many=True)
+                data = serializer.data
+                
+                # Store cache with creation timestamp
+                now = timezone.now()
+                cache.set(cache_key, data, timeout=cache_timeout)
+                cache.set(f"{cache_key}_created_at", now, timeout=cache_timeout)
+                return Response(data)
+            
+            return Response(cached)
+        
         else:
             return Response(
                 {"error": "Please provide either conversation_id or asset_id as query parameters."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+    
+    # Add signal handler methods to update cache when messages are created/updated
+
+    def _invalidate_conversation_cache(self, conversation_id):
+        """Invalidate the cache for a specific conversation"""
+        cache_key = f"chat_history_conversation_{conversation_id}"
+        cache.delete(cache_key)
+    
+    def _invalidate_asset_cache(self, asset_id):
+        """Invalidate the cache for an asset"""
+        cache_key = f"chat_history_asset_{asset_id}"
+        cache.delete(cache_key)
+        cache.delete(f"{cache_key}_created_at")
