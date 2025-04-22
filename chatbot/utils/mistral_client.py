@@ -171,15 +171,26 @@ class MistralLLMClient:
             )
 
     def _get_full_response(self, prompt, context=None, max_length=800):
-        domain_expert_instructions = (
-            "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
-            "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
-        )
+        if "Web Search Results:" in context:
+            # For web search queries
+            domain_expert_instructions = (
+                "You are Presage Insights' AI assistant. When web search results are provided, use them to answer the user's question. "
+                "Synthesize information from the search results to give accurate, helpful responses. "
+                "Be direct and comprehensive. Format your response with appropriate HTML for readability. "
+                "If the search results don't contain enough information to answer the question fully, state what you can determine "
+                "from the results and acknowledge any limitations."
+            )
+        else:
+            # For document queries (original behavior)
+            domain_expert_instructions = (
+                "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
+                "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
+            )
 
         system_content = (
-            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response that strictly follows the outline below. "
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response. "
             "Ensure the entire output starts with '<div class=\"response-container\">' and ends with '</div>', uses proper HTML tags (<p>, <h6>, <strong>) and lists (<ul>/<ol>), "
-            "and is entirely valid with all tags closed. The response must be concise, complete all outlined sections with a clear introduction, body, and conclusion, "
+            "and is entirely valid with all tags closed. The response must be concise with a clear introduction, body, and conclusion, "
             "and integrate the following domain expertise:\n\n" + domain_expert_instructions
         )
         if context:

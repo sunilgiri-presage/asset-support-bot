@@ -338,17 +338,28 @@ class GeminiLLMClient:
             # Fallback outline if Gemini fails
             return "<h6>Topic Overview</h6><ul><li>Key points</li></ul><h6>Details</h6><ul><li>Important details</li></ul><h6>Conclusion</h6><ul><li>Summary points</li></ul>"
 
-    def _get_full_response(self, prompt,context=None, max_length=800):
-        # System instruction specific to generating the FULL RESPONSE, incorporating domain expertise and format requirements.
-        domain_expert_instructions = (
-            "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
-            "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
-        )
+    def _get_full_response(self, prompt, context=None, max_length=800):
+        # Modified system instruction to properly handle web search results
+        if "Web Search Results:" in context:
+            # For web search queries
+            domain_expert_instructions = (
+                "You are Presage Insights' AI assistant. When web search results are provided, use them to answer the user's question. "
+                "Synthesize information from the search results to give accurate, helpful responses. "
+                "Be direct and comprehensive. Format your response with appropriate HTML for readability. "
+                "If the search results don't contain enough information to answer the question fully, state what you can determine "
+                "from the results and acknowledge any limitations."
+            )
+        else:
+            # For document queries (original behavior)
+            domain_expert_instructions = (
+                "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
+                "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
+            )
 
         system_instruction = (
-            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response that strictly follows the outline below. "
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response. "
             "Ensure the entire output starts with '<div class=\"response-container\">' and ends with '</div>', uses proper HTML tags (<p>, <h6>, <strong>) and lists (<ul>/<ol>), "
-            "and is entirely valid with all tags closed. The response must be concise, complete all outlined sections with a clear introduction, body, and conclusion, "
+            "and is entirely valid with all tags closed. The response must be concise with a clear introduction, body, and conclusion, "
             "and integrate the following domain expertise:\n\n" + domain_expert_instructions
         )
 
@@ -376,6 +387,14 @@ class GeminiLLMClient:
     def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
         logger.info("Querying Gemini LLM directly...")
 
+        # Check if this is a web search query
+        is_web_search = False
+        for message in messages:
+            if message['role'] == 'user' and 'WEB SEARCH RESULTS:' in message['content']:
+                is_web_search = True
+                logger.info("Detected web search query")
+                break
+
         # Convert OpenAI message format to Gemini 'contents' format
         contents = []
         system_instruction = ""
@@ -384,22 +403,30 @@ class GeminiLLMClient:
         # Extract system prompt first if present
         if messages and messages[0]['role'] == 'system':
             system_instruction = messages[0]['content']
-            messages = messages[1:] # Remove system message for turn processing
+            messages = messages[1:]  # Remove system message for turn processing
 
-        # Process remaining messages (assuming simple user/assistant turns for direct query)
-        # This simple conversion combines system prompt with the first user message
+        # Process remaining messages
         if messages and messages[0]['role'] == 'user':
-             current_user_prompt = messages[0]['content']
-             combined_first_prompt = f"{system_instruction}\n\n{messages[0]['content']}".strip()
-             contents.append({"role": "user", "parts": [{"text": combined_first_prompt}]})
-             # Note: This doesn't handle subsequent turns in the messages list well for the REST API.
-             # It primarily sends the system + first user prompt.
-        elif system_instruction: # Handle case where only a system prompt was given (unlikely but possible)
-             contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+            current_user_prompt = messages[0]['content']
+            
+            # For web search queries, modify the prompt slightly
+            if is_web_search:
+                combined_first_prompt = (
+                    f"{system_instruction}\n\n"
+                    f"IMPORTANT: You are answering a factual question using web search results. "
+                    f"Directly extract and present the relevant information from the search results. "
+                    f"Do not add disclaimers about being limited to document content.\n\n"
+                    f"{messages[0]['content']}"
+                ).strip()
+            else:
+                combined_first_prompt = f"{system_instruction}\n\n{messages[0]['content']}".strip()
+                
+            contents.append({"role": "user", "parts": [{"text": combined_first_prompt}]})
+        elif system_instruction:  # Handle case where only a system prompt was given
+            contents.append({"role": "user", "parts": [{"text": system_instruction}]})
         else:
-             logger.error("query_llm requires at least a user message.")
-             return "Error: No user message provided for query."
-
+            logger.error("query_llm requires at least a user message.")
+            return "Error: No user message provided for query."
 
         # Construct the Gemini payload
         payload = {
@@ -419,21 +446,30 @@ class GeminiLLMClient:
             result = response.json()
 
             if not result.get('candidates'):
-                 finish_reason = result.get('promptFeedback', {}).get('blockReason')
-                 if finish_reason:
-                     logger.error(f"Gemini direct query blocked. Reason: {finish_reason}")
-                     return f"Request failed due to safety settings or other issue: {finish_reason}"
-                 else:
-                     logger.error(f"Gemini direct query response missing 'candidates'.")
-                     return "Error: Unexpected response format from Gemini (missing candidates)."
+                finish_reason = result.get('promptFeedback', {}).get('blockReason')
+                if finish_reason:
+                    logger.error(f"Gemini direct query blocked. Reason: {finish_reason}")
+                    return f"Request failed due to safety settings or other issue: {finish_reason}"
+                else:
+                    logger.error(f"Gemini direct query response missing 'candidates'.")
+                    return "Error: Unexpected response format from Gemini (missing candidates)."
 
             content = result['candidates'][0].get('content', {})
             parts = content.get('parts', [])
             if not parts or 'text' not in parts[0]:
-                 logger.error(f"Gemini direct query response missing 'text' in parts.")
-                 return "Error: Unexpected response format from Gemini (missing text)."
+                logger.error(f"Gemini direct query response missing 'text' in parts.")
+                return "Error: Unexpected response format from Gemini (missing text)."
 
             reply = parts[0]['text'].strip()
+            
+            # For web search queries, ensure proper HTML formatting if needed
+            if is_web_search and not reply.strip().startswith('<div class="response-container"'):
+                reply = (
+                    '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                    f'<p>{reply}</p>'
+                    '</div>'
+                )
+                
             logger.info("Received direct response from Gemini LLM.")
             return reply
 

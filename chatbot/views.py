@@ -474,22 +474,36 @@ class ChatbotViewSet(viewsets.ViewSet):
         
         search_start = time.perf_counter()
         web_search_results = web_search(message_content)
+        search_time = time.perf_counter() - search_start
+        timings['web_search_time'] = f"{search_time:.2f} seconds"
+        
+        # Log actual search results content for debugging
+        logger.info(f"Web search results content preview: {web_search_results[:200]}...")
         
         if web_search_results:
             logger.info("Web search results found")
+            
+            # Create a more direct prompt that emphasizes using the search results
             combined_prompt = (
-                f"Web Search Results:\n{web_search_results}\n\n"
-                f"User Query:\n{message_content}\n\n"
-                f"Conversation Context:\n{conversation_context}\n\n"
-                f"Please provide a comprehensive response to the user's query using the above web search results."
+                f"USER QUERY: {message_content}\n\n"
+                f"WEB SEARCH RESULTS:\n{web_search_results}\n\n"
+                f"CONVERSATION CONTEXT:\n{conversation_context}\n\n"
+                "INSTRUCTIONS: Use the web search results above to directly answer the user's query. "
+                "If the search results contain relevant information about the query, synthesize and present that information clearly. "
+                "If the search results do not contain information relevant to the query, state specifically what was missing and "
+                "that you cannot answer based on the provided search results."
             )
         else:
             logger.info("No web search results found")
             combined_prompt = (
-                f"User Query:\n{message_content}\n\n"
-                f"Conversation Context:\n{conversation_context}\n\n"
-                f"No relevant web search results were found. Provide the best response based on your knowledge."
+                f"USER QUERY: {message_content}\n\n"
+                f"CONVERSATION CONTEXT: {conversation_context}\n\n"
+                "INSTRUCTIONS: No relevant web search results were found. "
+                "Inform the user that you could not find information related to their query."
             )
+        
+        # Log the complete prompt being sent to the LLM
+        logger.debug(f"Complete prompt for LLM: {combined_prompt}")
         
         # Use Gemini if web search results are long, otherwise Groq
         if web_search_results and len(web_search_results.split()) > 100:
@@ -498,13 +512,37 @@ class ChatbotViewSet(viewsets.ViewSet):
         else:
             llm_client = GroqLLMClient()
             logger.info("Using GroqLLMClient for web_search.")
-            
-        response_content = llm_client.generate_response(
-            prompt=message_content,
-            context=combined_prompt
-        )
         
-        timings['web_search_time'] = f"{time.perf_counter() - search_start:.2f} seconds"
+        # Modify the way we call the LLM
+        if isinstance(llm_client, GeminiLLMClient):
+            # Directly call the query method for better control
+            system_prompt = (
+                "You are a helpful assistant for Presage Insights. Answer the user's query using the provided web search results. "
+                "Focus on extracting and synthesizing relevant information from the search results. "
+                "Format your response with proper HTML, including a div with class 'response-container' and appropriate styling. "
+                "If the search results don't contain information needed to answer the query, explain this clearly."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": combined_prompt}
+            ]
+            
+            response_content = llm_client.query_llm(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=800
+            )
+            
+            # Ensure proper HTML formatting
+            if not response_content.strip().startswith('<div class="response-container"'):
+                response_content = f'<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">{response_content}</div>'
+        else:
+            # Use the standard method for other LLM clients
+            response_content = llm_client.generate_response(
+                prompt=message_content,
+                context=combined_prompt
+            )
+        
         return response_content
 
     def _perform_vibration_analysis(self, data):
