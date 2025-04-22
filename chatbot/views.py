@@ -282,7 +282,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                 try:
                     document_context, context_chunks_count = doc_future.result(timeout=18.0)
                     logger.info(f"Document context retrieved. Chunks count: {context_chunks_count}")
-                    logger.info(f"Document context content (preview): {document_context[:300]}")
+                    logger.info(f"Document context content (preview): {document_context[:300] if document_context else 'No context found'}")
                     timings['document_context_time'] = "Completed"
                 except TimeoutError:
                     logger.error("Document context retrieval timed out")
@@ -304,8 +304,20 @@ class ChatbotViewSet(viewsets.ViewSet):
             conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
             logger.info("Fallback: Error in context retrieval, using minimal context")
 
+        # Check if we have document context or need to use general knowledge
+        use_general_knowledge = False
+        if not document_context or context_chunks_count == 0:
+            logger.info("No document context found. Will use LLM's general knowledge.")
+            use_general_knowledge = True
+            timings['knowledge_source'] = "LLM General Knowledge"
+        else:
+            timings['knowledge_source'] = "Document Context"
+
         # Determine Optimal Prompt Strategy
-        if not document_context and conversation_context:
+        if use_general_knowledge:
+            logger.info("Using general knowledge strategy (no document context)")
+            prompt_template = "GENERAL_KNOWLEDGE"
+        elif not document_context and conversation_context:
             logger.info("Using conversation-focused context strategy (no document context)")
             prompt_template = "CONVERSATION_FOCUSED"
         elif context_chunks_count >= 2:
@@ -315,45 +327,67 @@ class ChatbotViewSet(viewsets.ViewSet):
             logger.info("Using basic context strategy (limited document context)")
             prompt_template = "BASIC"
         
-        combined_prompt = self._build_optimized_prompt(
-            prompt_template, 
-            message_content, 
-            document_context, 
-            conversation_context
-        )
-        logger.info(f"Combined prompt built using strategy: {prompt_template}")
+        # Build appropriate prompt based on whether we're using general knowledge or document context
+        if use_general_knowledge:
+            combined_prompt = self._build_general_knowledge_prompt(message_content, conversation_context)
+            logger.info("Built general knowledge prompt")
+        else:
+            combined_prompt = self._build_optimized_prompt(
+                prompt_template, 
+                message_content, 
+                document_context, 
+                conversation_context
+            )
+            logger.info(f"Combined prompt built using strategy: {prompt_template}")
+        
         logger.info(f"Combined prompt content (preview): {combined_prompt[:300]}")
 
-        # LLM Response Generation with Timeout
-        llm_client = self._select_appropriate_llm(document_context, conversation_context)
-        logger.info(f"Selected LLM client: {type(llm_client).__name__}")
-        timings['llm_client_used'] = type(llm_client).__name__
-
+        # LLM Response Generation with Fallbacks
         llm_start = time.perf_counter()
-        try:
-            with ThreadPoolExecutor() as llm_executor:
-                logger.info("Submitting prompt to LLM...")
-                future = llm_executor.submit(
-                    llm_client.generate_response,
-                    prompt=message_content,
-                    context=combined_prompt  # Make sure this actually contains the context
-                )
-                response_content = future.result(timeout=20.0)
-                logger.info("LLM response successfully generated")
-                # Log a portion of the response for debugging
-                logger.info(f"LLM response preview: {response_content[:200]}")
-        except TimeoutError:
-            logger.error("LLM response generation timed out after 20 seconds")
-            response_content = self._generate_timeout_response(prompt_template, context_chunks_count)
-            self._record_failure()  # Record this failure for circuit breaker
-        except Exception as e:
-            logger.error(f"Error generating LLM response: {str(e)}")
-            response_content = (
-                f"<div class='error-message'>I encountered an error while processing your request: {str(e)}</div>"
-            )
-            self._record_failure()  # Record this failure for circuit breaker
+        
+        # Create a list of LLM clients to try in order
+        llm_clients = self._get_llm_fallback_sequence(document_context, conversation_context)
+        logger.info(f"Prepared LLM fallback sequence with {len(llm_clients)} clients")
+        
+        response_content = None
+        successful_llm = None
+        
+        for idx, llm_client in enumerate(llm_clients):
+            try:
+                logger.info(f"Attempting with LLM client {idx+1}/{len(llm_clients)}: {type(llm_client).__name__}")
+                
+                with ThreadPoolExecutor() as llm_executor:
+                    future = llm_executor.submit(
+                        llm_client.generate_response,
+                        prompt=message_content,
+                        context=combined_prompt
+                    )
+                    # Adjust timeout for fallback attempts - shorter timeouts for subsequent attempts
+                    timeout_duration = 20.0 if idx == 0 else 15.0 if idx == 1 else 10.0
+                    response_content = future.result(timeout=timeout_duration)
+                    
+                    logger.info(f"LLM {type(llm_client).__name__} response successfully generated")
+                    logger.info(f"LLM response preview: {response_content[:200]}")
+                    successful_llm = type(llm_client).__name__
+                    break  # Exit the loop if successful
+                    
+            except (TimeoutError, Exception) as e:
+                error_type = "timeout" if isinstance(e, TimeoutError) else f"error: {str(e)}"
+                logger.error(f"LLM {type(llm_client).__name__} {error_type}")
+                
+                # Only record failure for circuit breaker if this was the primary LLM
+                if idx == 0:
+                    self._record_failure()
+        
+        # If all LLMs failed, generate a failure response
+        if response_content is None:
+            logger.error("All LLM clients failed to generate a response")
+            response_content = self._generate_all_llms_failed_response(prompt_template, context_chunks_count)
+            self._record_failure()  # Record this as a critical failure
         
         timings['llm_response_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
+        timings['successful_llm'] = successful_llm or "None"
+        
         return response_content
     
     def _handle_fetch_data(self, asset_id, message_content, timings):
@@ -1083,6 +1117,55 @@ Instructions:
         # Return unique keywords, maintaining original order
         seen = set()
         return [x for x in keywords if not (x in seen or seen.add(x))]
+    
+    def _get_llm_fallback_sequence(self, document_context, conversation_context):
+        """Return an ordered list of LLM clients to try in sequence."""
+        # Get the primary LLM based on context size
+        primary_llm = self._select_appropriate_llm(document_context, conversation_context)
+        
+        # Create a list of all available LLM clients
+        all_llms = [GeminiLLMClient(), MistralLLMClient(), GroqLLMClient()]
+        
+        # Remove the primary LLM from the list if it's already there
+        fallback_llms = [llm for llm in all_llms if not isinstance(llm, type(primary_llm))]
+        
+        # Return a sequence with primary LLM first, followed by fallbacks
+        return [primary_llm] + fallback_llms
+
+    def _generate_all_llms_failed_response(self, prompt_template, context_chunks_count):
+        """Generate a graceful response when all LLM attempts have failed."""
+        return (
+            "<div class='system-message'>"
+            "<p>I'm currently experiencing technical difficulties processing your question. "
+            "Our systems are working at reduced capacity at the moment.</p>"
+            "<p>Please try:</p>"
+            "<ul>"
+            "<li>Asking a shorter or simpler question</li>"
+            "<li>Trying again in a few minutes</li>"
+            "<li>Breaking your question into smaller parts</li>"
+            "</ul>"
+            "</div>"
+        )
+    
+    def _build_general_knowledge_prompt(self, message_content, conversation_context):
+        prompt = f"""
+    You are Presage Insights AI Assistant, a helpful AI assistant for answering questions.
+
+    IMPORTANT INSTRUCTIONS:
+    1. The user has asked a question that is not found in any document context.
+    2. If you know the answer to this question from your general knowledge, please provide a helpful, accurate response.
+    3. If you don't know the answer or are uncertain, be honest about your limitations.
+    4. Keep your response focused on the user's question.
+    5. Format your response in HTML using <div>, <p>, <ul>, <li>, <strong>, <em>, and other appropriate tags.
+
+    User question: {message_content}
+
+    Conversation context:
+    {conversation_context}
+
+    Please provide a helpful response using your general knowledge:
+    """
+        return prompt
     
     @action(detail=False, methods=['get'])
     def history(self, request):
