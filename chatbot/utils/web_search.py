@@ -16,54 +16,131 @@ logger = logging.getLogger('chatbot')
 
 def web_search(query, max_results=5):
     """
-    Enhanced web search function optimized for freshness and accuracy
-    
-    Args:
-        query (str): The search query
-        max_results (int): Maximum number of results to return
-    
-    Returns:
-        str: HTML formatted search results
+    Enhanced web search function optimized for freshness and accuracy.
+    Now short‐circuits weather queries into our dedicated weather API.
     """
-    results = []
-    
-    # Detect query type and time-sensitivity
+    # Detect query type and time‐sensitivity
     query_type, is_time_sensitive = detect_query_type(query)
     logger.info(f"Query type: {query_type}, time sensitivity: {is_time_sensitive}")
-    
-    # Create enhanced query based on intent and type
+
+    # --- NEW: handle weather directly ---
+    if query_type == 'weather':
+        # extract city/place from the query
+        m = re.search(r'weather\s+of\s+(.+)', query, re.IGNORECASE)
+        location = m.group(1).strip() if m else query
+        return format_weather_as_html(fetch_weather_for(location))
+
+    # existing flow for everything else
     original_query = query
     enhanced_query = enhance_query_by_type(query, query_type, is_time_sensitive)
     logger.info(f"Enhanced query: '{enhanced_query}'")
-    
-    # Determine best search services based on query type
     search_services = prioritize_search_services(query_type)
-    
-    # Try each search service until we get results
-    for service_name, search_function in search_services:
+    results = []
+    for service_name, fn in search_services:
         try:
-            service_results = search_function(enhanced_query, original_query, max_results, is_time_sensitive, query_type)
-            if service_results:
-                results.extend(service_results)
-                logger.info(f"{service_name.capitalize()} returned {len(service_results)} results")
-                # For specific query types, we might want to stop after first successful service
+            sr = fn(enhanced_query, original_query, max_results, is_time_sensitive, query_type)
+            if sr:
+                results.extend(sr)
+                logger.info(f"{service_name} returned {len(sr)} results")
                 if len(results) >= max_results and query_type != 'general':
                     break
         except Exception as e:
-            logger.error(f"{service_name.capitalize()} search failed: {e}")
-    
-    # Sort results by relevance to query type and freshness
+            logger.error(f"{service_name} search failed: {e}")
     results = rank_results(results, is_time_sensitive, query_type)
-    
-    # Ensure unique high-quality results
     results = deduplicate_and_filter(results)
+    return format_results_as_html(results[:max_results], is_time_sensitive, query_type)
+
+def fetch_weather_for(location):
+    """
+    Call OpenWeatherMap to get current + short‐term forecast.
+    Returns a dict with either:
+      - 'error': error message, OR
+      - 'location', 'current', and 'forecast' keys.
+    """
+    api_key = os.getenv('OPENWEATHER_API_KEY')
+    base    = 'https://api.openweathermap.org/data/2.5'
+
+    try:
+        cw_resp = requests.get(f"{base}/weather", params={
+            'q': location,
+            'units': 'metric',
+            'appid': api_key
+        }, timeout=5)
+        cw = cw_resp.json()
+        if cw.get('cod') != 200:
+            return {'error': cw.get('message', 'Failed to fetch current weather')}
+        
+        fc_resp = requests.get(f"{base}/forecast", params={
+            'q': location,
+            'units': 'metric',
+            'appid': api_key
+        }, timeout=5)
+        fc = fc_resp.json()
+        entries = fc.get('list') or []
+        
+        # Build daily high/low
+        daily = {}
+        for entry in entries:
+            date = entry.get('dt_txt', '').split()[0]
+            main = entry.get('main', {})
+            temp = main.get('temp')
+            cond = entry.get('weather', [{}])[0].get('description', '')
+            if not date or temp is None: 
+                continue
+            if date not in daily:
+                daily[date] = {'high': temp, 'low': temp, 'cond': cond}
+            else:
+                daily[date]['high'] = max(daily[date]['high'], temp)
+                daily[date]['low']  = min(daily[date]['low'],  temp)
+        
+        return {
+            'location': cw.get('name', location),
+            'current': {
+                'temp': cw['main']['temp'],
+                'desc': cw['weather'][0]['description'],
+                'feels': cw['main']['feels_like']
+            },
+            'forecast': [
+                {'date': d, **v} for d, v in sorted(daily.items())[:5]
+            ]
+        }
+
+    except Exception as e:
+        logger.error(f"Weather fetch failed for {location}: {e}")
+        return {'error': 'Weather service unavailable'}
+
+def format_weather_as_html(w):
+    """
+    Render the weather dict (or error) into your HTML style block.
+    """
+    if 'error' in w:
+        return (
+            f'<div style="font-family:Arial,sans-serif; padding:1em;'
+            f'background:#fdecea; border-radius:5px; margin-bottom:1em;">'
+            f'<strong>Weather Error:</strong> {w["error"]}</div>'
+        )
     
-    # Return formatted results
-    if results:
-        return format_results_as_html(results[:max_results], is_time_sensitive, query_type)
-    else:
-        logger.warning(f"All search methods failed for query: '{original_query}'")
-        return ""
+    html = (
+      '<div class="web-search-results" style="font-family:Arial,sans-serif; padding:1em; '
+      'background:#e9f7fe; border-radius:5px; margin-bottom:1em;">'
+      f'<h5>Current Weather in {w["location"]}</h5>'
+      f'<p><strong>{w["current"]["temp"]}°C</strong>, '
+      f'{w["current"]["desc"].capitalize()} '
+      f'(Feels like {w["current"]["feels"]}°C)</p>'
+      '<h6>5-Day Forecast</h6><ul style="padding-left:20px;">'
+    )
+    for day in w['forecast']:
+        try:
+            dt = datetime.fromisoformat(day['date']).strftime("%b %d")
+        except:
+            dt = day['date']
+        html += (
+          f'<li><strong>{dt}</strong>: '
+          f'{day["cond"].capitalize()}, '
+          f'High {round(day["high"])}°C / Low {round(day["low"])}°C</li>'
+        )
+    html += '</ul></div>'
+    return html
 
 
 def detect_query_type(query):
@@ -118,294 +195,193 @@ def detect_query_type(query):
 
 def enhance_query_by_type(query, query_type, is_time_sensitive):
     """
-    Enhance query for better search results based on detected type and intent
+    Enhance query for better search results based on detected type and intent.
+    Strips punctuation that can break API calls.
     """
-    query_lower = query.lower()
-    
-    # Type-specific enhancements
+    q = query.strip()
+    # remove trailing question marks and other problematic punctuation
+    q = re.sub(r'[?]+', '', q)
+
+    lower = q.lower()
     if query_type == 'weather':
-        # If the query already has "current" or "now", keep it
-        if not any(term in query_lower for term in ['current', 'now', 'today']):
-            enhanced = f"{query} current"
-        else:
-            enhanced = query
-            
-        # Add "weather" if not present
-        if 'weather' not in query_lower and 'temperature' not in query_lower:
-            enhanced = f"{enhanced} weather"
-            
-        # Add "real-time" for more accurate results
-        enhanced = f"{enhanced} real-time data"
-        
+        place = re.search(r'of\s+(.+)$', q, re.IGNORECASE)
+        place_str = place.group(1) if place else ''
+        enhanced = f"weather {place_str} current conditions"
     elif query_type == 'news':
-        # For news, freshness is critical
         today = datetime.now().strftime("%Y-%m-%d")
-        enhanced = f"{query} latest news {today}"
-        
+        enhanced = f"{q} latest news {today}"
     elif query_type == 'sports':
-        # For sports, we want recent results
-        if 'score' in query_lower or 'result' in query_lower:
-            enhanced = f"{query} final score latest"
-        else:
-            enhanced = f"{query} recent"
-            
+        enhanced = f"{q} final score latest" if 'score' in lower else f"{q} recent update"
     elif query_type == 'event':
-        # For events, add date context
         today = datetime.now().strftime("%Y-%m-%d")
-        enhanced = f"{query} schedule {today}"
-        
+        enhanced = f"{q} schedule {today}"
     elif query_type == 'product':
-        # For products, we want current info
-        enhanced = f"{query} current price information"
-        
+        enhanced = f"{q} current price and specs"
     elif query_type == 'location':
-        # For locations, add specificity
-        enhanced = f"{query} exact location information"
-        
+        enhanced = f"{q} exact address and map"
     elif query_type == 'person':
-        # For person queries, focus on accurate info
-        enhanced = f"{query} official information biography"
-        
+        enhanced = f"{q} official biography"
     elif query_type == 'factual':
-        # For factual queries, focus on authoritative sources
-        enhanced = f"{query} accurate information"
-        
+        enhanced = f"{q} authoritative source"
     elif is_time_sensitive:
-        # Extract date context for time-sensitive queries
-        today = datetime.now()
-        yesterday = today - timedelta(days=1)
-        today_str = today.strftime("%Y-%m-%d")
-        
-        # Check if query refers to specific time frames
-        if 'yesterday' in query_lower:
-            enhanced = f"{query.replace('yesterday', '')} {yesterday.strftime('%Y-%m-%d')}"
-        elif 'today' in query_lower:
-            enhanced = f"{query.replace('today', '')} {today_str}"
-        elif 'this week' in query_lower:
-            enhanced = f"{query.replace('this week', '')} past 7 days"
-        elif 'this month' in query_lower:
-            enhanced = f"{query.replace('this month', '')} past 30 days"
-        else:
-            # General time-sensitive enhancement
-            enhanced = f"{query} latest update"
+        enhanced = f"{q} latest update"
     else:
-        # For general queries without time sensitivity
-        enhanced = f"{query} comprehensive information"
-        
+        enhanced = f"{q} comprehensive"
+
     return enhanced.strip()
 
 
 def prioritize_search_services(query_type):
     """
-    Return prioritized search services based on query type
+    Return prioritized search services based on query type.
+    Increased weight on SerpAPI for news and weather.
     """
-    # Default order
-    default_order = [
-        ('google', search_google), 
-        ('serpapi', search_serpapi), 
-        ('duckduckgo', search_duckduckgo), 
-        ('wikipedia', search_wikipedia)
-    ]
-    
-    # Type-specific ordering
     if query_type == 'weather':
         return [
-            ('google', search_google),  # Google often has direct weather widgets
             ('serpapi', search_serpapi),
-            ('duckduckgo', search_duckduckgo)
-        ]
-    elif query_type == 'news':
-        return [
-            ('serpapi', search_serpapi),  # SerpAPI often includes news boxes
-            ('google', search_google),
-            ('duckduckgo', search_duckduckgo)
-        ]
-    elif query_type == 'factual':
-        return [
-            ('wikipedia', search_wikipedia),  # Wikipedia is great for facts
             ('google', search_google),
             ('duckduckgo', search_duckduckgo),
-            ('serpapi', search_serpapi)
         ]
-    
-    return default_order
+    if query_type == 'news':
+        return [
+            ('serpapi', search_serpapi),
+            ('google',  search_google),
+            ('wikipedia', search_wikipedia),
+        ]
+    if query_type == 'factual':
+        return [
+            ('wikipedia', search_wikipedia),
+            ('google',    search_google),
+            ('duckduckgo',search_duckduckgo),
+        ]
+    return [
+        ('google', search_google),
+        ('serpapi', search_serpapi),
+        ('duckduckgo', search_duckduckgo),
+        ('wikipedia', search_wikipedia),
+    ]
 
 
 def search_google(enhanced_query, original_query, max_results, is_time_sensitive, query_type):
-    """
-    Search using Google Custom Search API with type-specific optimizations
-    """
     api_key = os.getenv('GOOGLE_API_KEY')
-    cse_id = os.getenv('GOOGLE_CSE_ID')
+    cse_id  = os.getenv('GOOGLE_CSE_ID')
     if not (api_key and cse_id):
         logger.warning("Missing GOOGLE_API_KEY or GOOGLE_CSE_ID")
         return []
-        
-    logger.info(f"Google Custom Search: '{enhanced_query}'")
+
+    # Cap at Google’s max of 10 per request
+    num_results = min(max_results * 3, 10)
+
     params = {
-        'key': api_key,
-        'cx': cse_id,
-        'q': enhanced_query,
-        'num': max_results * 2,  # Request more to filter for quality
+        'key':       api_key,
+        'cx':        cse_id,
+        'q':         enhanced_query,
+        'num':       num_results,
     }
-    
-    # Set time-based parameters for time-sensitive queries
+
     if is_time_sensitive:
-        if query_type in ['weather', 'news', 'sports']:
-            params['dateRestrict'] = 'd1'  # Last 1 day for highly time-sensitive
-        else:
-            params['dateRestrict'] = 'd3'  # Last 3 days for other time-sensitive
-            
-        params['sort'] = 'date'  # Sort by date for freshness
-    
-    # Add type-specific parameters
+        days = 'd2' if query_type in ['weather','news','sports'] else 'd5'
+        params['dateRestrict'] = days
+        params['sort']        = 'date'
     if query_type == 'news':
-        params['searchType'] = 'news'  # Use news search for news queries
-    
+        params['searchType']  = 'news'
+
     resp = requests.get('https://www.googleapis.com/customsearch/v1', params=params, timeout=10)
     resp.raise_for_status()
-    data = resp.json()
-    items = data.get('items', [])
-    
+    items = resp.json().get('items', [])
+
     results = []
     for item in items:
-        # Extract metadata for better ranking and display
-        metadata = extract_metadata(item, query_type)
-        
+        meta = extract_metadata(item, query_type)
         results.append({
-            'title': item.get('title', 'Result'),
-            'snippet': item.get('snippet', ''),
-            'link': item.get('link', '#'),
-            'source': 'google',
-            'query_type': query_type,
-            'publish_date': metadata.get('publish_date'),
-            'relevance_score': metadata.get('relevance_score', 1),
-            'freshness_score': metadata.get('freshness_score', 1),
-            'type_match_score': metadata.get('type_match_score', 1)
+            'title':            item.get('title'),
+            'snippet':          item.get('snippet'),
+            'link':             item.get('link'),
+            'source':           'google',
+            'query_type':       query_type,
+            'publish_date':     meta.get('publish_date'),
+            'relevance_score':  meta.get('relevance_score', 1),
+            'freshness_score':  meta.get('freshness_score', 1),
+            'type_match_score': meta.get('type_match_score', 1)
         })
-        
     return results
 
 
 def search_serpapi(enhanced_query, original_query, max_results, is_time_sensitive, query_type):
     """
-    Search using SerpAPI with type-specific optimizations
+    Search using SerpAPI with type-specific optimizations.
+    Now fetches more (`num = max_results*3`), supports broader tbs windows.
     """
-    serpapi_key = os.getenv('SERPAPI_KEY')
-    if not serpapi_key:
+    serp_key = os.getenv('SERPAPI_KEY')
+    if not serp_key:
         logger.warning("Missing SERPAPI_KEY")
         return []
-        
-    logger.info(f"SerpAPI search: '{enhanced_query}'")
+
     params = {
-        'engine': 'google',
-        'q': enhanced_query,
-        'api_key': serpapi_key,
-        'num': max_results * 2
+        'engine':  'google',
+        'q':       enhanced_query,
+        'api_key': serp_key,
+        'num':     max_results * 3,
     }
-    
-    # Add time-based parameters for time-sensitive queries
+
     if is_time_sensitive:
-        if query_type in ['weather', 'news', 'sports']:
-            params['tbs'] = 'qdr:d1'  # Last 1 day for highly time-sensitive
-        else:
-            params['tbs'] = 'qdr:d3'  # Last 3 days for time-sensitive
-    
-    # Add type-specific parameters
+        # last 2 days for core types, 5 for others
+        params['tbs'] = 'qdr:d2' if query_type in ['weather','news','sports'] else 'qdr:d5'
+
     if query_type == 'news':
-        params['tbm'] = 'nws'  # News tab for news queries
-    elif query_type == 'weather':
-        # No special parameter, but we'll look for weather widgets in results
-        pass
-        
-    resp = requests.get('https://serpapi.com/search', params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    
+        params['tbm'] = 'nws'
+
+    data = requests.get('https://serpapi.com/search', params=params, timeout=10).json()
     results = []
-    
-    # Check for special answer boxes based on query type
-    if query_type == 'weather' and 'answer_box' in data:
-        answer_box = data.get('answer_box', {})
-        if answer_box.get('type') == 'weather_result':
-            # Direct weather widget result
-            weather_info = answer_box.get('weather_results', {})
-            location = weather_info.get('location', '')
-            temperature = weather_info.get('temperature', '')
-            condition = weather_info.get('condition', '')
-            
-            snippet = f"Weather for {location}: {temperature}, {condition}"
-            
-            results.append({
-                'title': f"Current Weather - {location}",
-                'snippet': snippet,
-                'link': f"https://www.google.com/search?q=weather+{quote(location)}",
-                'source': 'serpapi_widget',
-                'query_type': query_type,
-                'publish_date': datetime.now().strftime("%Y-%m-%d"),  # Current date
-                'relevance_score': 5,  # Very high for direct answers
-                'freshness_score': 5,  # Very high for current data
-                'type_match_score': 5  # Perfect match for query type
-            })
-    
-    # Check for knowledge graph
-    if 'knowledge_graph' in data:
-        kg = data.get('knowledge_graph', {})
-        title = kg.get('title', '')
-        description = kg.get('description', '')
-        
-        if title and description:
-            results.append({
-                'title': f"Knowledge: {title}",
-                'snippet': description,
-                'link': kg.get('source', {}).get('link', '#'),
-                'source': 'serpapi_knowledge',
-                'query_type': query_type,
-                'publish_date': None,
-                'relevance_score': 4,  # High for knowledge graph
-                'freshness_score': 2,  # Medium for knowledge info
-                'type_match_score': 4 if query_type in ['factual', 'person', 'location'] else 2
-            })
-    
-    # First check news results (usually more recent)
-    news_results = data.get('news_results', [])
-    for item in news_results:
-        date_str = item.get('date', '')
-        
+
+    # Weather widget
+    if query_type == 'weather' and data.get('answer_box',{}).get('type') == 'weather_result':
+        w = data['answer_box']['weather_results']
+        snippet = f"{w.get('location')}: {w.get('temperature')}, {w.get('condition')}"
         results.append({
-            'title': item.get('title', 'News Result'),
-            'snippet': item.get('snippet', ''),
-            'link': item.get('link', '#'),
-            'source': 'serpapi_news',
-            'query_type': query_type,
-            'publish_date': date_str,
-            'relevance_score': 3,  # High for news
+            'title':           f"Current Weather - {w.get('location')}",
+            'snippet':         snippet,
+            'link':            f"https://www.google.com/search?q=weather+{quote(w.get('location',''))}",
+            'source':          'serpapi_widget',
+            'query_type':      query_type,
+            'publish_date':    datetime.now().strftime("%Y-%m-%d"),
+            'relevance_score': 5,
+            'freshness_score': 5,
+            'type_match_score':5
+        })
+
+    # News results
+    for item in data.get('news_results', []):
+        date_str = item.get('date','')
+        results.append({
+            'title':           item.get('title'),
+            'snippet':         item.get('snippet'),
+            'link':            item.get('link'),
+            'source':          'serpapi_news',
+            'query_type':      query_type,
+            'publish_date':    date_str,
+            'relevance_score': 3,
             'freshness_score': 4 if date_str else 2,
-            'type_match_score': 5 if query_type == 'news' else 2
+            'type_match_score':5 if query_type=='news' else 2
         })
-    
-    # Then check organic results
-    organic_results = data.get('organic_results', [])
-    for item in organic_results:
-        date_info = item.get('date', '')
-        snippet = item.get('snippet', '')
-        
-        # Calculate type-specific relevance
-        type_match_score = calculate_type_match(item, query_type, snippet)
-        
+
+    # Organic results
+    for item in data.get('organic_results', []):
+        dt = item.get('date','')
+        tm = calculate_type_match(item, query_type, item.get('snippet',''))
         results.append({
-            'title': item.get('title', 'Result'),
-            'snippet': snippet,
-            'link': item.get('link', '#'),
-            'source': 'serpapi',
-            'query_type': query_type,
-            'publish_date': date_info,
+            'title':           item.get('title'),
+            'snippet':         item.get('snippet'),
+            'link':            item.get('link'),
+            'source':          'serpapi',
+            'query_type':      query_type,
+            'publish_date':    dt,
             'relevance_score': 2,
-            'freshness_score': 3 if date_info else 1,
-            'type_match_score': type_match_score
+            'freshness_score': 3 if dt else 1,
+            'type_match_score':tm
         })
-        
-    return results
+
+    return results[:max_results*2]
 
 
 def search_duckduckgo(enhanced_query, original_query, max_results, is_time_sensitive, query_type):

@@ -5,7 +5,7 @@ import time
 import concurrent.futures
 import logging
 from rest_framework import viewsets, status
-from rest_framework.decorators import action, api_view
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 from chatbot.models import Conversation, Message
@@ -167,7 +167,7 @@ class ChatbotViewSet(viewsets.ViewSet):
             elif action_type == "fetch_data":
                 response_content = self._handle_fetch_data(asset_id, message_content, timings)
             elif action_type == "web_search":
-                response_content = self._handle_web_search(message_content, timings)
+                response_content = self._handle_web_search(message_content,conversation, timings)
             else:
                 logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
                 response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
@@ -454,19 +454,19 @@ class ChatbotViewSet(viewsets.ViewSet):
             timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
             return f"<div class='error-message'>An error occurred while processing data for asset {asset_id}: {str(e)}</div>"
 
-    def _handle_web_search(self, message_content, timings):
+    def _handle_web_search(self, message_content,conversation, timings):
         logger.info(f"Handling web search for query: {message_content}")
         
         try:
-            # Get conversation context with better timeout handling
-            # try:
-            #     conv_start = time.perf_counter()
-            #     conversation_context = self._get_cached_or_build_conversation_context(conversation, message_content)
-            #     timings['conversation_context_time'] = f"{time.perf_counter() - conv_start:.2f} seconds"
-            # except Exception as e:
-            #     logger.error(f"Error building conversation context: {str(e)}")
-            #     conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
-            #     timings['conversation_context_time'] = "Error - using minimal context"
+            #Get conversation context with better timeout handling
+            try:
+                conv_start = time.perf_counter()
+                conversation_context = self._get_cached_or_build_conversation_context(conversation, message_content)
+                timings['conversation_context_time'] = f"{time.perf_counter() - conv_start:.2f} seconds"
+            except Exception as e:
+                logger.error(f"Error building conversation context: {str(e)}")
+                conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+                timings['conversation_context_time'] = "Error - using minimal context"
             
             # Execute web search
             search_start = time.perf_counter()
@@ -496,7 +496,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                 user_prompt = (
                     f"USER QUERY: {message_content}\n\n"
                     f"WEB SEARCH RESULTS:\n{search_text}\n\n"
-                    # f"CONVERSATION CONTEXT:\n{conversation_context}\n\n"
+                    f"CONVERSATION CONTEXT:\n{conversation_context}\n\n"
                     "Please provide a comprehensive answer to the user's query based on the search results."
                 )
             else:
@@ -509,7 +509,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                 
                 user_prompt = (
                     f"USER QUERY: {message_content}\n\n"
-                    # f"CONVERSATION CONTEXT: {conversation_context}\n\n"
+                    f"CONVERSATION CONTEXT: {conversation_context}\n\n"
                     "No relevant web search results were found. Please inform the user and suggest alternatives."
                 )
             
@@ -782,28 +782,6 @@ Instructions:
             prefix = "User:" if msg.is_user else "Assistant:"
             context_lines.append(f"{prefix} {msg.content}")
         return "\n".join(context_lines)
-
-    def _summarize_conversation_context(self, conversation, llm_client, word_threshold=300):
-        mistral_client = MistralLLMClient()
-        summary = conversation.summary or ""
-        if len(summary.split()) > word_threshold:
-            prompt = (
-                "Please summarize the following conversation history into a concise summary (2-3 lines):\n\n"
-                f"{summary}"
-            )
-            new_summary = mistral_client.generate_response(prompt=prompt, context="")
-            conversation.summary = new_summary
-            conversation.save()
-            return new_summary
-        return summary
-
-    def _build_context_prompt(self, conversation, llm_client, max_recent=10, word_threshold=300):
-        summarized_context = self._summarize_conversation_context(conversation, llm_client, word_threshold)
-        recent_context = self._build_conversation_context(conversation, max_recent)
-        if summarized_context:
-            return f"Conversation Summary:\n{summarized_context}\n\nRecent Conversation:\n{recent_context}"
-        else:
-            return recent_context
         
     def _build_minimal_context_prompt(self, conversation, max_recent=5):
         # Only retrieve the most recent messages with limited fields
@@ -930,69 +908,12 @@ Instructions:
             return " ".join(tech_terms if tech_terms else words[:8])
         return query
 
-    def _deduplicate_chunks(self, chunks):
-        """Remove redundant chunks with high text overlap"""
-        if not chunks:
-            return []
-        
-        unique_chunks = [chunks[0]]
-        for chunk in chunks[1:]:
-            # Check if this chunk is too similar to existing ones
-            is_duplicate = False
-            for existing in unique_chunks:
-                similarity = self._text_similarity(chunk.content, existing.content)
-                if similarity > 0.7:  # 70% content overlap threshold
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                unique_chunks.append(chunk)
-        
-        return unique_chunks
-
     def _text_similarity(self, text1, text2):
         """Calculate simple text similarity ratio"""
         # Simple implementation - can be improved with better algorithms
         common_words = set(text1.lower().split()) & set(text2.lower().split())
         all_words = set(text1.lower().split()) | set(text2.lower().split())
         return len(common_words) / len(all_words) if all_words else 0
-
-    def _limit_chunks_by_tokens(self, chunks, max_tokens):
-        """Limit chunks to stay within token budget"""
-        result = []
-        token_count = 0
-        
-        for chunk in chunks:
-            chunk_tokens = len(chunk.content.split())
-            if token_count + chunk_tokens > max_tokens:
-                break
-            
-            result.append(chunk)
-            token_count += chunk_tokens
-        
-        return result
-
-    def _format_context_enhanced(self, chunks):
-        """Format chunks with better structure and relevance indicators"""
-        if not chunks:
-            return ""
-        
-        formatted_sections = []
-        
-        # Sort chunks by relevance score if available
-        chunks.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
-        
-        for i, chunk in enumerate(chunks):
-            # Add section header with relevance indicator
-            relevance = getattr(chunk, 'score', None)
-            relevance_str = f" (Relevance: {relevance:.2f})" if relevance is not None else ""
-            
-            section_name = getattr(chunk, 'section_name', f"Section {i+1}")
-            section_header = f"[{section_name}{relevance_str}]"
-            
-            formatted_sections.append(f"{section_header}\n{chunk.content}")
-        
-        return "\n\n".join(formatted_sections)
 
     def _get_cached_or_build_conversation_context(self, conversation, current_query):
         """Gets conversation context from cache or builds it if not available"""
@@ -1082,97 +1003,6 @@ Instructions:
                 "Use the available document and conversation context as a base. Where information is missing, rely on your expertise to infer and generate "
                 "the necessary details. Ensure that the final answer is complete and does not simply mention that certain details are not available."
             )
-
-    def _generate_timeout_response(self, template_type, context_chunk_count):
-        """Generate appropriate timeout response based on context"""
-        
-        if template_type == "DOCUMENT_FOCUSED" and context_chunk_count > 3:
-            return (
-                "<div class='timeout-message'>"
-                "<p>I found relevant information in your documents, but I'm having trouble processing "
-                "the complete response right now. Here are some suggestions:</p>"
-                "<ul>"
-                "<li>Try asking a more specific question about a particular aspect</li>"
-                "<li>Break your query into smaller parts</li>"
-                "<li>Try again in a moment when the system is less busy</li>"
-                "</ul>"
-                "</div>"
-            )
-        else:
-            return (
-                "<div class='timeout-message'>"
-                "<p>I apologize, but I'm having trouble processing your request at the moment. "
-                "This could be due to high system load or the complexity of your query.</p>"
-                "<p>Please try again with a more specific question or try again shortly.</p>"
-                "</div>"
-            )
-    
-    def _extract_user_information(self, conversation_context):
-        """Extract key user information from conversation history to aid in recall"""
-        mistral_client = MistralLLMClient()
-        
-        extraction_prompt = f"""
-        Extract key personal information the user has shared about themselves from this conversation.
-        Focus on details like their name, role, preferences, background, etc.
-        Format as JSON with appropriate keys.
-        Only include information explicitly mentioned by the user.
-        
-        Conversation:
-        {conversation_context}
-        """
-        
-        try:
-            info_json_str = mistral_client.generate_response(prompt=extraction_prompt, context="")
-            user_info = json.loads(info_json_str)
-            return user_info
-        except:
-            # Fallback to simpler extraction if JSON parsing fails
-            logger.warning("JSON parsing of user information failed, using simpler extraction")
-            return {"raw_extraction": info_json_str}
-        
-    def _extract_query_keywords(self, query):
-        """Extract key focus words from user query to improve recall precision"""
-        # Remove common stopwords
-        stopwords = {"the", "a", "an", "is", "are", "was", "were", "be", "been", 
-                    "being", "to", "of", "and", "or", "not", "no", "in", "on", 
-                    "at", "by", "for", "with", "about", "against", "between", 
-                    "into", "through", "during", "before", "after", "above", 
-                    "below", "from", "up", "down", "out", "off", "over", "under", 
-                    "again", "further", "then", "once", "here", "there", "when", 
-                    "where", "why", "how", "all", "any", "both", "each", "few", 
-                    "more", "most", "other", "some", "such", "than", "too", "very", 
-                    "can", "will", "just", "should", "now"}
-        
-        # Extract potentially important terms
-        words = query.lower().split()
-        keywords = []
-        
-        # Special handling for "tell me about X" pattern
-        tell_about_match = re.search(r"tell (?:me|us) about ([^?.,!]+)", query.lower())
-        if tell_about_match:
-            subject = tell_about_match.group(1).strip()
-            keywords.append(subject)
-        
-        # Add named entities and non-stopwords
-        for word in words:
-            # Clean the word
-            word = word.strip(".,!?:;\"'()[]{}").lower()
-            
-            # Keep terms that might be names or important identifiers
-            if (word not in stopwords and len(word) > 2) or word[0].isupper():
-                keywords.append(word)
-        
-        # Always look for personal references
-        personal_terms = ["i", "me", "my", "mine", "myself", "name", "job", "role", 
-                        "company", "work", "position", "background"]
-        
-        for term in personal_terms:
-            if term in query.lower() and term not in keywords:
-                keywords.append(term)
-        
-        # Return unique keywords, maintaining original order
-        seen = set()
-        return [x for x in keywords if not (x in seen or seen.add(x))]
     
     def _get_llm_fallback_sequence(self, document_context, conversation_context):
         """Return an ordered list of LLM clients to try in sequence."""
@@ -1401,8 +1231,6 @@ Instructions:
                 {"error": "Please provide either conversation_id or asset_id as query parameters."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-    
-    # Add signal handler methods to update cache when messages are created/updated
 
     def _invalidate_conversation_cache(self, conversation_id):
         """Invalidate the cache for a specific conversation"""

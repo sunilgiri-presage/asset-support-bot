@@ -352,8 +352,10 @@ class GeminiLLMClient:
         else:
             # For document queries (original behavior)
             domain_expert_instructions = (
-                "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
-                "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
+                "You are a document retrieval assistant. Your primary task is to answer user questions based on the supplied document whenever possible. "
+                "First, carefully check if the document contains information relevant to the question. "
+                "If the document contains relevant information, use only that information to construct your answer. "
+                "If the document does not contain relevant information, or if the information is insufficient, you may use your own general knowledge to provide the best possible answer."
             )
 
         system_instruction = (
