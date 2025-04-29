@@ -290,6 +290,17 @@ class GroqLLMClient:
     
 
     def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
+        logger.info("Querying Groq LLM directly...")
+
+        # Ensure there is at least one user message
+        if not messages or not any(m.get('role') == 'user' for m in messages):
+            logger.error("query_llm requires at least one user message")
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Error:</strong> No user message provided. Please retry with a valid query.</p>'
+                '</div>'
+            )
+
         payload = {
             "model": self.model,
             "messages": messages,
@@ -303,8 +314,7 @@ class GroqLLMClient:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logger.info("Querying Groq LLM directly...")
-
+        # Send the request
         try:
             response = requests.post(
                 self.base_url,
@@ -312,23 +322,56 @@ class GroqLLMClient:
                 headers=headers,
                 timeout=(10, 120)
             )
-
             response.raise_for_status()
-            result = response.json()
-            reply = result['choices'][0]['message']['content'].strip()
-
-            logger.info("Received response from LLM.")
-            return reply
-
         except requests.Timeout:
             logger.error("Groq LLM request timed out")
-            return "Request timed out. Please try again."
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Timeout:</strong> The request took too long. Please try again later.</p>'
+                '</div>'
+            )
         except requests.RequestException as e:
-            logger.error(f"Groq LLM request failed: {str(e)}")
-            return "Request failed. Please check logs."
-        except KeyError as e:
-            logger.error(f"Unexpected response format: {str(e)}")
-            return "Unexpected error occurred while parsing the LLM response."
+            status = getattr(e.response, 'status_code', 'N/A')
+            text = getattr(e.response, 'text', str(e))
+            logger.error(f"Groq LLM request failed: HTTP {status} - {text}")
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p><strong>API Error (Status {status}):</strong> {text}</p>'
+                '<p>Please check your API key, network connection, and try again.</p>'
+                '</div>'
+            )
+
+        # Parse and validate the response
+        try:
+            result = response.json()
+            choices = result.get('choices', [])
+            if not choices or 'message' not in choices[0] or 'content' not in choices[0]['message']:
+                raise KeyError("Missing choice content")
+
+            reply = choices[0]['message']['content'].strip()
+        except (ValueError, KeyError) as e:
+            logger.error(f"Parse error from Groq response: {e} -- full response: {response.text}")
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Response Format Error:</strong> Unexpected format from Groq. '
+                'Please try again or contact support if this persists.</p>'
+                '</div>'
+            )
         except Exception as e:
-            logger.error(f"General error in query_llm: {str(e)}")
-            return "Unexpected error. Please try again later."
+            logger.error(f"Unexpected error parsing Groq response: {e}", exc_info=True)
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Error:</strong> An unexpected error occurred. Please try again later.</p>'
+                '</div>'
+            )
+
+        # Wrap plain text in a container if needed
+        if not reply.startswith('<div class="response-container"'):
+            reply = (
+                '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p>{reply}</p>'
+                '</div>'
+            )
+
+        logger.info("Received response from Groq LLM.")
+        return reply

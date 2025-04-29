@@ -389,50 +389,45 @@ class GeminiLLMClient:
     def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
         logger.info("Querying Gemini LLM directly...")
 
-        # Check if this is a web search query
-        is_web_search = False
-        for message in messages:
-            if message['role'] == 'user' and 'WEB SEARCH RESULTS:' in message['content']:
-                is_web_search = True
-                logger.info("Detected web search query")
-                break
+        # Detect web‐search context
+        is_web_search = any(
+            msg['role'] == 'user' and 'WEB SEARCH RESULTS:' in msg['content'] 
+            for msg in messages
+        )
+        if is_web_search:
+            logger.info("Detected web search query")
 
-        # Convert OpenAI message format to Gemini 'contents' format
-        contents = []
+        # Extract system and user prompts
         system_instruction = ""
-        current_user_prompt = ""
-
-        # Extract system prompt first if present
         if messages and messages[0]['role'] == 'system':
-            system_instruction = messages[0]['content']
-            messages = messages[1:]  # Remove system message for turn processing
+            system_instruction = messages.pop(0)['content']
 
-        # Process remaining messages
-        if messages and messages[0]['role'] == 'user':
-            current_user_prompt = messages[0]['content']
-            
-            # For web search queries, modify the prompt slightly
-            if is_web_search:
-                combined_first_prompt = (
-                    f"{system_instruction}\n\n"
-                    f"IMPORTANT: You are answering a factual question using web search results. "
-                    f"Directly extract and present the relevant information from the search results. "
-                    f"Do not add disclaimers about being limited to document content.\n\n"
-                    f"{messages[0]['content']}"
-                ).strip()
-            else:
-                combined_first_prompt = f"{system_instruction}\n\n{messages[0]['content']}".strip()
-                
-            contents.append({"role": "user", "parts": [{"text": combined_first_prompt}]})
-        elif system_instruction:  # Handle case where only a system prompt was given
-            contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+        if not messages or messages[0]['role'] != 'user':
+            logger.error("query_llm requires at least one user message")
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Error:</strong> No user message provided. Please retry with a valid query.</p>'
+                '</div>'
+            )
+
+        user_content = messages[0]['content']
+        if is_web_search:
+            user_prompt = (
+                f"{system_instruction}\n\n"
+                "IMPORTANT: You are answering a factual question using web search results. "
+                "Extract and present relevant information directly from the results, without "
+                "disclaimers about document limitations.\n\n"
+                f"{user_content}"
+            )
         else:
-            logger.error("query_llm requires at least a user message.")
-            return "Error: No user message provided for query."
+            user_prompt = f"{system_instruction}\n\n{user_content}".strip()
 
-        # Construct the Gemini payload
+        payload_contents = [{"role": "user", "parts": [{"text": user_prompt}]}]
+
+        # Build payload
         payload = {
-            "contents": contents,
+            "contents": payload_contents,
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
@@ -443,54 +438,62 @@ class GeminiLLMClient:
         url = f"{self.generate_url}?key={self.api_key}"
 
         try:
-            response = requests.post(url, json=payload, headers=headers, timeout=(10, 180))
-            response.raise_for_status()
-            result = response.json()
-
-            if not result.get('candidates'):
-                finish_reason = result.get('promptFeedback', {}).get('blockReason')
-                if finish_reason:
-                    logger.error(f"Gemini direct query blocked. Reason: {finish_reason}")
-                    return f"Request failed due to safety settings or other issue: {finish_reason}"
-                else:
-                    logger.error(f"Gemini direct query response missing 'candidates'.")
-                    return "Error: Unexpected response format from Gemini (missing candidates)."
-
-            content = result['candidates'][0].get('content', {})
-            parts = content.get('parts', [])
-            if not parts or 'text' not in parts[0]:
-                logger.error(f"Gemini direct query response missing 'text' in parts.")
-                return "Error: Unexpected response format from Gemini (missing text)."
-
-            reply = parts[0]['text'].strip()
-            
-            # For web search queries, ensure proper HTML formatting if needed
-            if is_web_search and not reply.strip().startswith('<div class="response-container"'):
-                reply = (
-                    '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
-                    f'<p>{reply}</p>'
-                    '</div>'
-                )
-                
-            logger.info("Received direct response from Gemini LLM.")
-            return reply
-
+            resp = requests.post(url, json=payload, headers=headers, timeout=(10, 180))
+            resp.raise_for_status()
         except requests.Timeout:
             logger.error("Gemini LLM direct query timed out")
-            return "Request timed out. Please try again."
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Timeout:</strong> The request took too long (180s). '
+                'Please try again or reduce the request size.</p>'
+                '</div>'
+            )
         except requests.RequestException as e:
-            error_detail = ""
-            if e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    error_detail = f" - {error_data.get('error', {}).get('message', e.response.text)}"
-                except json.JSONDecodeError:
-                    error_detail = f" - Status Code: {e.response.status_code}"
-            logger.error(f"Gemini LLM direct query failed: {str(e)}{error_detail}")
-            return "Request failed. Please check logs."
-        except (KeyError, IndexError, ValueError) as e:
-            logger.error(f"Unexpected response format or processing error in direct query: {str(e)}")
-            return "Unexpected error occurred while parsing the LLM response."
-        except Exception as e:
-            logger.error(f"General error in query_llm: {str(e)}", exc_info=True)
-            return "Unexpected error. Please try again later."
+            # Capture any HTTP/non-2xx errors
+            status = getattr(e.response, 'status_code', 'N/A')
+            text = getattr(e.response, 'text', str(e))
+            logger.error(f"Gemini LLM direct query failed: HTTP {status} - {text}")
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p><strong>API Error (Status {status}):</strong> {text}</p>'
+                '<p>Please check your API key, network connection, and try again.</p>'
+                '</div>'
+            )
+
+        # Parse JSON
+        try:
+            result = resp.json()
+            candidates = result.get('candidates', [])
+            if not candidates:
+                raise KeyError("No candidates in response")
+
+            parts = candidates[0].get('content', {}).get('parts', [])
+            if not parts or 'text' not in parts[0]:
+                raise KeyError("Missing 'text' in candidate parts")
+
+            reply = parts[0]['text'].strip()
+
+        except (ValueError, KeyError) as e:
+            # JSON decode or missing fields
+            logger.error(f"Parse error from Gemini response: {e} -- full response: {resp.text}")
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Response Format Error:</strong> Unexpected format from Gemini. '
+                'Please try again or contact support if this persists.</p>'
+                '</div>'
+            )
+
+        # Wrap plain text in a container if needed
+        if is_web_search and not reply.startswith('<div class="response-container"'):
+            reply = (
+                '<div class="response-container" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p>{reply}</p>'
+                '</div>'
+            )
+
+        logger.info("Received direct response from Gemini LLM.")
+        return reply

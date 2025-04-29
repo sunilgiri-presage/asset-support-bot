@@ -306,41 +306,34 @@ class ChatbotViewSet(viewsets.ViewSet):
             conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
             logger.info("Fallback: Error in context retrieval, using minimal context")
 
-        # Check if we have document context or need to use general knowledge
-        use_general_knowledge = False
+        # Determine Optimal Prompt Strategy
         if not document_context or context_chunks_count == 0:
-            logger.info("No document context found. Will use LLM's general knowledge.")
-            use_general_knowledge = True
-            timings['knowledge_source'] = "LLM General Knowledge"
+            logger.info("No document context found. Using conversation-focused context.")
+            timings['knowledge_source'] = "Conversation Context"
+            prompt_template = "CONVERSATION_FOCUSED"
         else:
             timings['knowledge_source'] = "Document Context"
+            if context_chunks_count >= 2:
+                coverage = self._compute_query_context_coverage(message_content, document_context)
+                logger.info(f"Query/context coverage: {coverage:.2f}")
+                if coverage < 0.3:
+                    logger.info("Low coverage—switching to conversation-focused to let LLM use its own knowledge")
+                    prompt_template = "CONVERSATION_FOCUSED"
+                    timings['knowledge_source'] = "Conversation Context (due to low coverage)"
+                else:
+                    logger.info(f"Using document-focused context with {context_chunks_count} chunks")
+                    prompt_template = "DOCUMENT_FOCUSED"
+            else:
+                logger.info("Using basic context strategy (limited document context)")
+                prompt_template = "BASIC"
 
-        # Determine Optimal Prompt Strategy
-        if use_general_knowledge:
-            logger.info("Using general knowledge strategy (no document context)")
-            prompt_template = "GENERAL_KNOWLEDGE"
-        elif not document_context and conversation_context:
-            logger.info("Using conversation-focused context strategy (no document context)")
-            prompt_template = "CONVERSATION_FOCUSED"
-        elif context_chunks_count >= 2:
-            logger.info(f"Using document-focused context with {context_chunks_count} chunks")
-            prompt_template = "DOCUMENT_FOCUSED"
-        else:
-            logger.info("Using basic context strategy (limited document context)")
-            prompt_template = "BASIC"
-        
-        # Build appropriate prompt based on whether we're using general knowledge or document context
-        if use_general_knowledge:
-            combined_prompt = self._build_general_knowledge_prompt(message_content, conversation_context)
-            logger.info("Built general knowledge prompt")
-        else:
-            combined_prompt = self._build_optimized_prompt(
-                prompt_template, 
-                message_content, 
-                document_context, 
-                conversation_context
-            )
-            logger.info(f"Combined prompt built using strategy: {prompt_template}")
+        combined_prompt = self._build_optimized_prompt(
+            prompt_template, 
+            message_content, 
+            document_context, 
+            conversation_context
+        )
+        logger.info(f"Combined prompt built using strategy: {prompt_template}")
         
         logger.info(f"Combined prompt content (preview): {combined_prompt[:300]}")
 
@@ -987,10 +980,16 @@ Instructions:
         elif template == "CONVERSATION_FOCUSED":
             # When document context is missing but conversation context is available, rely on it and add expert reasoning.
             return (
-                f"Conversation History:\n{conversation_context}\n\n"
-                f"Current User Query: {query}\n\n"
-                "Instructions: Based on the conversation history, provide a detailed, helpful, and complete response that covers every part of the query. "
-                "If any information is not found directly in the conversation, use your own expertise and reasoning to infer the best possible answer."
+                "You are Presage Insights AI Assistant, a helpful AI assistant for answering questions.\n\n"
+                "IMPORTANT INSTRUCTIONS:\n"
+                "1. The user’s question isn’t covered by any document context.\n"
+                "2. If you know the answer from your general knowledge, provide a helpful, accurate response.\n"
+                "3. If you’re uncertain or don’t know, be honest about your limitations.\n"
+                "4. Keep your response focused on the user’s question.\n"
+                "5. Format your response in HTML using <div>, <p>, <ul>, <li>, <strong>, <em>, etc.\n\n"
+                f"User question: {query}\n\n"
+                f"Conversation context:\n{conversation_context}\n\n"
+                "Please provide a helpful response using your general knowledge:"
             )
         
         else:  # BASIC
@@ -1003,6 +1002,20 @@ Instructions:
                 "Use the available document and conversation context as a base. Where information is missing, rely on your expertise to infer and generate "
                 "the necessary details. Ensure that the final answer is complete and does not simply mention that certain details are not available."
             )
+        
+    def _compute_query_context_coverage(self, query: str, context: str) -> float:
+        """
+        Returns the fraction of unique words in `query` that also appear in `context`.
+        A low ratio means most of the query isn't represented in the context.
+        """
+        # very simple tokenization
+        query_tokens = set(re.findall(r"\w+", query.lower()))
+        if not query_tokens:
+            return 0.0
+        context_lc = context.lower()
+        present = sum(1 for tok in query_tokens if tok in context_lc)
+        return present / len(query_tokens)
+
     
     def _get_llm_fallback_sequence(self, document_context, conversation_context):
         """Return an ordered list of LLM clients to try in sequence."""
@@ -1032,26 +1045,6 @@ Instructions:
             "</ul>"
             "</div>"
         )
-    
-    def _build_general_knowledge_prompt(self, message_content, conversation_context):
-        prompt = f"""
-    You are Presage Insights AI Assistant, a helpful AI assistant for answering questions.
-
-    IMPORTANT INSTRUCTIONS:
-    1. The user has asked a question that is not found in any document context.
-    2. If you know the answer to this question from your general knowledge, please provide a helpful, accurate response.
-    3. If you don't know the answer or are uncertain, be honest about your limitations.
-    4. Keep your response focused on the user's question.
-    5. Format your response in HTML using <div>, <p>, <ul>, <li>, <strong>, <em>, and other appropriate tags.
-
-    User question: {message_content}
-
-    Conversation context:
-    {conversation_context}
-
-    Please provide a helpful response using your general knowledge:
-    """
-        return prompt
     
     def _extract_text_from_html(self, html_content):
         """Extract plain text from HTML search results for better LLM processing"""

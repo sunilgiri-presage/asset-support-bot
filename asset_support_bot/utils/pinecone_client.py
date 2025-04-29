@@ -25,7 +25,7 @@ class PineconeClient:
             raise ValueError("Pinecone API key is not set")
 
         self.index_name = os.getenv('PINECONE_INDEX_NAME', 'asset-support-index')
-        self.pc = Pinecone(api_key=api_key)
+        self.pc = Pinecone(api_key=api_key, environment=os.getenv("PINECONE_ENVIRONMENT"))
         if self.index_name not in self.pc.list_indexes().names():
             self.pc.create_index(
                 name=self.index_name,
@@ -201,3 +201,37 @@ class PineconeClient:
         result = filtered[:top_k] if filtered else self._get_emergency_fallback(asset_id, top_k)
         self.query_cache[key] = result
         return result
+
+    def delete_document(self, document_id: str, asset_id: str):
+        """
+        Delete all vectors associated with a given document by:
+        1. Querying vectors for the given asset.
+        2. Filtering matches where metadata.document_id == document_id.
+        3. Deleting those vectors by their IDs.
+        """
+        try:
+            # Use the correct vector dimension (768) for the dummy query vector.
+            dummy_vector = [0] * 768
+            results = self.index.query(
+                vector=dummy_vector,
+                filter={"asset_id": str(asset_id)},
+                top_k=1000,
+                include_metadata=True
+            )
+
+            # Extract IDs for matches with the specified document_id.
+            ids_to_delete = [
+                match.id
+                for match in results.matches
+                if match.metadata.get("document_id") == document_id
+            ]
+
+            if ids_to_delete:
+                self.index.delete(ids=ids_to_delete)
+                logger.info(f"Deleted {len(ids_to_delete)} vectors for document {document_id}")
+            else:
+                logger.warning(f"No vectors found for document {document_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting document {document_id}: {e}")
+            return False
