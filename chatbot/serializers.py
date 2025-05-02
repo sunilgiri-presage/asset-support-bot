@@ -54,7 +54,7 @@ class MessagePairSerializer(serializers.Serializer):
             })
         
         return messages
-    
+
 class VibrationAnalysisInputSerializer(serializers.Serializer):
     asset_type = serializers.CharField()
     running_RPM = serializers.FloatField()

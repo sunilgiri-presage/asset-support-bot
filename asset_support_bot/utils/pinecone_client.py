@@ -146,6 +146,277 @@ class PineconeClient:
         self.query_cache[key] = fallback
         return fallback
 
+    def get_fallback_chunks(self, asset_id, query=None, limit=5, methods=None):
+        """
+        Advanced fallback retrieval that uses multiple techniques to find relevant chunks
+        when standard semantic search fails.
+        
+        Args:
+            asset_id (str): The asset ID to search within
+            query (str): The query text to find relevant chunks for
+            limit (int): Number of chunks to return
+            methods (list): List of fallback methods to try, defaults to all
+                Options: 'keyword', 'ngram', 'expanded', 'contextual', 'random'
+                
+        Returns:
+            list: Ranked list of relevant chunks with scores
+        """
+        if not methods:
+            methods = ['keyword', 'ngram', 'expanded', 'contextual', 'random']
+        
+        logger.info(f"Executing fallback retrieval with methods: {methods}")
+        
+        query_text = query if query else ""
+        
+        # Cache key for this query
+        cache_key = f"deep_fallback_{asset_id}_{hash(query_text)}_{limit}_{'-'.join(methods)}"
+        if cache_key in self.query_cache:
+            return self.query_cache[cache_key]
+        
+        all_results = []
+        
+        # Method 1: Keyword matching with tf-idf style scoring
+        if 'keyword' in methods:
+            keywords = set(re.findall(r"\w{3,}", query_text.lower()))
+            if keywords:
+                # Get a larger sample of chunks to analyze
+                sample_chunks = self._fetch_asset_chunks(asset_id, limit=100)
+                
+                # Calculate inverse document frequency for weighting
+                keyword_doc_count = Counter()
+                for chunk in sample_chunks:
+                    chunk_text = chunk.get('text', '').lower()
+                    found_keywords = set()
+                    for keyword in keywords:
+                        if keyword in chunk_text:
+                            found_keywords.add(keyword)
+                    for keyword in found_keywords:
+                        keyword_doc_count[keyword] += 1
+                
+                # Calculate tf-idf style scores
+                keyword_results = []
+                for chunk in sample_chunks:
+                    text = chunk.get('text', '')
+                    chunk_text_lower = text.lower()
+                    
+                    score = 0
+                    for keyword in keywords:
+                        # Skip very common words that appear in most documents
+                        if keyword_doc_count[keyword] > len(sample_chunks) * 0.8:
+                            continue
+                            
+                        # Term frequency
+                        tf = chunk_text_lower.count(keyword)
+                        if tf > 0:
+                            # Inverse document frequency component
+                            idf = np.log(len(sample_chunks) / (1 + keyword_doc_count[keyword]))
+                            score += tf * idf
+                    
+                    # Normalize by text length to avoid favoring longer chunks
+                    if text:
+                        score = score / (np.log(1 + len(text.split())))
+                    
+                    if score > 0:
+                        keyword_results.append({
+                            "text": text,
+                            "score": 0.3 + score * 0.2,  # Scale to be comparable with semantic scores
+                            "chunk_index": chunk.get("chunk_index", -1),
+                            "method": "keyword"
+                        })
+                
+                keyword_results.sort(key=lambda x: x['score'], reverse=True)
+                all_results.extend(keyword_results[:limit])
+        
+        # Method 2: N-gram matching for phrase queries
+        if 'ngram' in methods and len(query_text.split()) > 2:
+            # Extract important phrases from the query
+            phrases = []
+            words = query_text.split()
+            for i in range(len(words) - 1):
+                phrases.append(f"{words[i]} {words[i+1]}")
+            
+            if len(words) >= 3:
+                for i in range(len(words) - 2):
+                    phrases.append(f"{words[i]} {words[i+1]} {words[i+2]}")
+            
+            # Get chunks and score by phrase matches
+            sample_chunks = self._fetch_asset_chunks(asset_id, limit=50)
+            ngram_results = []
+            
+            for chunk in sample_chunks:
+                text = chunk.get('text', '')
+                if not text:
+                    continue
+                    
+                matches = 0
+                for phrase in phrases:
+                    if phrase.lower() in text.lower():
+                        matches += 1
+                
+                if matches > 0:
+                    score = 0.25 + (matches / len(phrases)) * 0.25
+                    ngram_results.append({
+                        "text": text,
+                        "score": score,
+                        "chunk_index": chunk.get("chunk_index", -1),
+                        "method": "ngram"
+                    })
+            
+            ngram_results.sort(key=lambda x: x['score'], reverse=True)
+            all_results.extend(ngram_results[:limit])
+        
+        # Method 3: Expanded query using related terms
+        if 'expanded' in methods:
+            # Expand the query with related terms/synonyms
+            expanded_terms = self._expand_query_terms(query_text)
+            
+            if expanded_terms:
+                try:
+                    expanded_query = query_text + " " + " ".join(expanded_terms)
+                    emb = self.generate_embedding(expanded_query)
+                    
+                    if emb:
+                        resp = self.index.query(
+                            vector=emb,
+                            filter={"asset_id": str(asset_id)},
+                            top_k=limit,
+                            include_metadata=True
+                        )
+                        
+                        expanded_results = [
+                            {
+                                "text": m.metadata.get("text", ""), 
+                                "score": m.score * 0.9,  # Slightly lower confidence
+                                "chunk_index": m.metadata.get("chunk_index", -1),
+                                "method": "expanded"
+                            }
+                            for m in resp.matches if m.score > 0.3
+                        ]
+                        all_results.extend(expanded_results)
+                except Exception as e:
+                    logger.warning(f"Expanded query search failed: {e}")
+        
+        # Method 4: Contextual search by retrieving adjacent chunks
+        if 'contextual' in methods:
+            # First get some base chunks
+            base_chunks = []
+            for result in all_results[:5]:  # Use top results from other methods
+                if 'chunk_index' in result and result['chunk_index'] >= 0:
+                    base_chunks.append(result['chunk_index'])
+            
+            if base_chunks:
+                # Get adjacent chunks
+                adjacent_indices = set()
+                for idx in base_chunks:
+                    adjacent_indices.add(idx - 1)
+                    adjacent_indices.add(idx + 1)
+                
+                adjacent_indices = adjacent_indices - set(base_chunks)
+                if adjacent_indices:
+                    try:
+                        # Fetch these specific chunks
+                        contextual_results = []
+                        sample_chunks = self._fetch_asset_chunks(asset_id, limit=100)
+                        
+                        for chunk in sample_chunks:
+                            if chunk.get('chunk_index') in adjacent_indices:
+                                contextual_results.append({
+                                    "text": chunk.get('text', ''),
+                                    "score": 0.4,  # Contextual chunks get medium confidence
+                                    "chunk_index": chunk.get('chunk_index', -1),
+                                    "method": "contextual"
+                                })
+                        
+                        all_results.extend(contextual_results[:limit//2])
+                    except Exception as e:
+                        logger.warning(f"Contextual search failed: {e}")
+        
+        # Method 5: Random sampling as last resort
+        if 'random' in methods and len(all_results) < limit:
+            try:
+                needed = limit - len(all_results)
+                random_chunks = self._get_emergency_fallback(asset_id, limit=needed * 2)
+                
+                # Add method identifier
+                for chunk in random_chunks:
+                    chunk['method'] = 'random'
+                    
+                all_results.extend(random_chunks[:needed])
+            except Exception as e:
+                logger.warning(f"Random sampling failed: {e}")
+        
+        # Deduplicate by chunk_index
+        seen_indices = set()
+        unique_results = []
+        
+        for result in sorted(all_results, key=lambda x: x.get('score', 0), reverse=True):
+            chunk_index = result.get('chunk_index')
+            if chunk_index not in seen_indices:
+                seen_indices.add(chunk_index)
+                unique_results.append(result)
+                if len(unique_results) >= limit:
+                    break
+        
+        # Cache and return
+        self.query_cache[cache_key] = unique_results[:limit]
+        logger.info(f"Fallback retrieval found {len(unique_results)} chunks using methods: {methods}")
+        return unique_results[:limit]
+    
+    def _fetch_asset_chunks(self, asset_id, limit=50):
+        """Helper to fetch chunks for an asset"""
+        try:
+            resp = self.index.query(
+                vector=[0]*768,  # Zero vector to get random chunks
+                filter={"asset_id": str(asset_id)},
+                top_k=limit,
+                include_metadata=True
+            )
+            return [
+                {"text": m.metadata.get("text", ""), 
+                 "chunk_index": m.metadata.get("chunk_index", -1)} 
+                for m in resp.matches
+            ]
+        except Exception as e:
+            logger.error(f"Error fetching asset chunks: {e}")
+            return []
+    
+    def _expand_query_terms(self, query_text):
+        """
+        Generate expanded terms for the query to broaden search
+        Returns list of additional search terms
+        """
+        # Simple expansion for common terms - would be better with a thesaurus
+        expansions = {
+            "error": ["exception", "failure", "issue", "problem", "bug"],
+            "install": ["setup", "configure", "deploy"],
+            "api": ["endpoint", "service", "interface"],
+            "data": ["information", "records", "content"],
+            "user": ["account", "profile", "customer"],
+            "config": ["settings", "options", "preferences"],
+            "database": ["db", "storage", "repository"],
+            "auth": ["authentication", "login", "credentials"],
+            "file": ["document", "attachment"],
+            "update": ["upgrade", "patch", "change"],
+            "delete": ["remove", "erase"],
+            "add": ["create", "insert"],
+            "function": ["method", "procedure", "routine"],
+            "variable": ["parameter", "argument", "attribute"],
+            "library": ["package", "module", "dependency"],
+            "event": ["trigger", "callback", "action"],
+            "version": ["release", "build"],
+            "test": ["check", "verify", "validate"],
+            "cloud": ["hosted", "remote", "service"]
+        }
+        
+        expanded = []
+        words = set(re.findall(r"\w+", query_text.lower()))
+        
+        for word in words:
+            if word in expansions:
+                expanded.extend(expansions[word][:2])  # Limit to 2 expansions per word
+                
+        return expanded[:5]  # Limit total expansions
+
     def query_similar_chunks(self, query_text, asset_id, top_k=5, similarity_threshold=0.4):
         """
         Retrieve top_k chunks for query_text using semantic + keyword fallback.
@@ -201,7 +472,6 @@ class PineconeClient:
         result = filtered[:top_k] if filtered else self._get_emergency_fallback(asset_id, top_k)
         self.query_cache[key] = result
         return result
-
     def delete_document(self, document_id: str, asset_id: str):
         """
         Delete all vectors associated with a given document by:

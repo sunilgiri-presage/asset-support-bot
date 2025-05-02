@@ -14,7 +14,7 @@ load_dotenv()
 logger = logging.getLogger('chatbot')
 
 
-def web_search(query, max_results=8):
+def web_search(query, max_results=10):
     """
     Enhanced web search function optimized for freshness and accuracy.
     Now short‐circuits weather queries into our dedicated weather API.
@@ -141,7 +141,6 @@ def format_weather_as_html(w):
         )
     html += '</ul></div>'
     return html
-
 
 def detect_query_type(query):
     """

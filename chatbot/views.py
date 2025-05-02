@@ -227,7 +227,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                     1. "document_query": For most questions related to documentation, content understanding, explanations, and general knowledge requests. This is the default handler for most queries that don't explicitly require data retrieval or web search. This also handles questions about personal information previously shared.
                     Example: "How does this code work?", "Explain machine learning concepts", "What are best practices for API design?", "Tell me about vibration analysis", or "What's my name?" 
 
-                    2. "fetch_data": For requests about asset data, metrics, statistics, or vibration analysis.
+                    2. "fetch_data": For requests about asset data, metrics, statistics, or charts, trends analysis.
                     Example: "Show me data for asset 12345" or "What's the RPM of my machine?"
 
                     3. "web_search": ONLY for queries that absolutely require real-time or online information that cannot be answered from stored document context or conversation history.
@@ -316,7 +316,7 @@ class ChatbotViewSet(viewsets.ViewSet):
             if context_chunks_count >= 2:
                 coverage = self._compute_query_context_coverage(message_content, document_context)
                 logger.info(f"Query/context coverage: {coverage:.2f}")
-                if coverage < 0.3:
+                if coverage < 0.5:
                     logger.info("Low coverage—switching to conversation-focused to let LLM use its own knowledge")
                     prompt_template = "CONVERSATION_FOCUSED"
                     timings['knowledge_source'] = "Conversation Context (due to low coverage)"
