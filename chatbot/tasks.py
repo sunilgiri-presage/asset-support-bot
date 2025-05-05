@@ -47,7 +47,7 @@ def process_fetch_data(message_id, asset_id, user_message_content, authorization
                 headers['X-User-ID'] = x_user_id
 
             # Fetch data from API
-            api_url = f"https://processor.presageinsights.ai/api/api/asset-data/{asset_id}/"
+            api_url = f"http://192.168.1.36:8090/api/asset-data/{asset_id}/"
             response = requests.get(api_url, headers=headers, timeout=120)  # Added timeout
             
             if response.status_code == 200:

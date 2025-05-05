@@ -22,7 +22,7 @@ import requests
 from rest_framework.permissions import AllowAny
 from django.core.cache import cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from django.db.models import Max, Prefetch
+from django.db.models import Count,Max, Prefetch
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ handler = logging.StreamHandler(sys.stdout)  # Explicitly use stdout
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
+CACHE_TIMEOUT = 60
 # Initialize PineconeClient at module level
 try:
     pinecone_client = PineconeClient()
@@ -1004,184 +1004,129 @@ class ChatbotViewSet(viewsets.ViewSet):
     
     @action(detail=False, methods=['get'])
     def history(self, request):
-        conversation_id = request.query_params.get('conversation_id')
+        conv_id = request.query_params.get('conversation_id')
         asset_id = request.query_params.get('asset_id')
-        cache_timeout = 60
-        
-        # Create a message pairs utility function to avoid duplication
-        def create_message_pairs(messages, conversation):
+
+        def fetch_pairs_for_conversation(conv):
+            msgs = conv.ordered_messages
             pairs = []
-            user_message = None
-            
-            for msg in messages:
+            user_msg = None
+            for msg in msgs:
                 if msg.is_user:
-                    if user_message:
-                        pairs.append({
-                            'conversation': conversation,
-                            'user_message': user_message,
-                            'system_message': None,
-                        })
-                    user_message = msg
+                    if user_msg:
+                        pairs.append({'conversation': conv, 'user_message': user_msg, 'system_message': None})
+                    user_msg = msg
                 else:
-                    if user_message:
-                        pairs.append({
-                            'conversation': conversation,
-                            'user_message': user_message,
-                            'system_message': msg,
-                        })
-                        user_message = None
+                    if user_msg:
+                        pairs.append({'conversation': conv, 'user_message': user_msg, 'system_message': msg})
+                        user_msg = None
                     else:
-                        pairs.append({
-                            'conversation': conversation,
-                            'user_message': None,
-                            'system_message': msg,
-                        })
-            
-            if user_message:
-                pairs.append({
-                    'conversation': conversation,
-                    'user_message': user_message,
-                    'system_message': None,
-                })
-                
+                        pairs.append({'conversation': conv, 'user_message': None, 'system_message': msg})
+            if user_msg:
+                pairs.append({'conversation': conv, 'user_message': user_msg, 'system_message': None})
             return pairs
 
-        # only fetch the fields we actually use
-        message_qs = Message.objects.only('id', 'is_user', 'content', 'created_at', 'processing_status')
+        if conv_id:
+            cache_key = f"chat_history_conversation_{conv_id}"
 
-        if conversation_id:
-            cache_key = f"chat_history_conversation_{conversation_id}"
-            
-            # Check if there are any processing messages
-            has_processing = message_qs.filter(
-                conversation__id=conversation_id, 
-                is_user=False, 
-                processing_status__in=["pending", "processing"]
-            ).exists()
-            
-            # If there are processing messages, don't use cache
-            if has_processing:
-                cached = None
-            else:
-                # Try to get from cache first
-                cached = cache.get(cache_key)
-                
-                # Check if we should invalidate cache - get latest message timestamp
-                if cached:
-                    conversation = get_object_or_404(Conversation, id=conversation_id)
-                    latest_message = message_qs.filter(conversation=conversation).order_by('-created_at').first()
-                    
-                    # If there's no latest message in the DB or cached data is empty, invalidate
-                    if not latest_message or not cached:
-                        cached = None
-                    else:
-                        # Check if our cached data includes all messages by comparing counts
-                        msg_count = message_qs.filter(conversation=conversation).count()
-                        
-                        # Calculate message count in cached data
-                        cached_msg_count = sum(1 for pair in cached if pair.get('user_message')) + \
-                                        sum(1 for pair in cached if pair.get('system_message'))
-                        
-                        if cached_msg_count != msg_count:
-                            cached = None
+            # Use get_or_set to fetch or build data
+            def build_conv_data():
+                conv = (
+                    Conversation.objects
+                    .filter(id=conv_id)
+                    .annotate(msg_count=Count('messages'))
+                    .prefetch_related(
+                        Prefetch(
+                            'messages',
+                            queryset=Message.objects.only('id','is_user','content','created_at','processing_status')
+                                          .order_by('created_at'),
+                            to_attr='ordered_messages'
+                        )
+                    )
+                    .first()
+                )
+                if not conv:
+                    return None
 
-            if not cached:
-                conversation = get_object_or_404(Conversation, id=conversation_id)
-                messages = message_qs.filter(conversation=conversation).order_by('created_at')
-                
-                message_pairs = create_message_pairs(messages, conversation)
-                
-                serializer = MessagePairSerializer(message_pairs, many=True)
-                data = serializer.data
-                
-                # Only cache if there are no processing messages
-                if not has_processing:
-                    cache.set(cache_key, data, timeout=cache_timeout)
-                    
-                return Response(data)
-            
-            return Response(cached)
+                # Check processing flags
+                has_proc = any(m.processing_status in ['pending','processing'] for m in conv.ordered_messages if not m.is_user)
+
+                pairs = fetch_pairs_for_conversation(conv)
+                serialized = MessagePairSerializer(pairs, many=True).data
+                return {
+                    'data': serialized,
+                    'msg_count': conv.msg_count,
+                    'cached_at': timezone.now(),
+                    'has_processing': has_proc,
+                }
+
+            cached = cache.get(cache_key)
+            if cached:
+                # serve from cache if stable
+                if not cached['has_processing'] and cached['msg_count'] == (
+                    Message.objects.filter(conversation_id=conv_id).count()
+                ):
+                    return Response(cached['data'])
+
+            built = build_conv_data()
+            if built is None:
+                return Response(status=status.HTTP_404_NOT_FOUND)
+
+            if not built['has_processing']:
+                cache.set(cache_key, built, timeout=CACHE_TIMEOUT)
+
+            return Response(built['data'])
 
         elif asset_id:
             cache_key = f"chat_history_asset_{asset_id}"
-            
-            # Check if there are any processing messages for this asset
-            has_processing = message_qs.filter(
-                conversation__asset_id=asset_id, 
-                is_user=False, 
-                processing_status__in=["pending", "processing"]
-            ).exists()
-            
-            # If there are processing messages, don't use cache
-            if has_processing:
-                cached = None
-            else:
-                # Try to get from cache first
-                cached = cache.get(cache_key)
-                
-                # Check if we should invalidate cache
-                if cached:
-                    # Get all conversations for this asset
-                    conversations = Conversation.objects.filter(asset_id=asset_id)
-                    
-                    if not conversations.exists() or not cached:
-                        cached = None
-                    else:
-                        # Get the latest update time across all conversations
-                        latest_update = conversations.aggregate(Max('updated_at'))['updated_at__max']
-                        
-                        # Check if we have new conversations or messages since the cache was created
-                        cache_created_time = cache.get(f"{cache_key}_created_at")
-                        
-                        if not cache_created_time or latest_update and latest_update > cache_created_time:
-                            cached = None
-            
-            if not cached:
-                conversations = (
+
+            def build_asset_data():
+                now = timezone.now()
+                convs = (
                     Conversation.objects
                     .filter(asset_id=asset_id)
+                    .annotate(msg_count=Count('messages'))
                     .order_by('-updated_at')
                     .prefetch_related(
                         Prefetch(
                             'messages',
-                            queryset=message_qs.order_by('created_at'),
+                            queryset=Message.objects.only('id','is_user','content','created_at','processing_status')
+                                          .order_by('created_at'),
                             to_attr='ordered_messages'
                         )
                     )
                 )
-                
-                all_message_pairs = []
-                for conv in conversations:
-                    conv_pairs = create_message_pairs(conv.ordered_messages, conv)
-                    all_message_pairs.extend(conv_pairs)
-                
-                serializer = MessagePairSerializer(all_message_pairs, many=True)
-                data = serializer.data
-                
-                # Only cache if there are no processing messages
-                if not has_processing:
-                    # Store cache with creation timestamp
-                    now = timezone.now()
-                    cache.set(cache_key, data, timeout=cache_timeout)
-                    cache.set(f"{cache_key}_created_at", now, timeout=cache_timeout)
-                    
-                return Response(data)
-            
-            return Response(cached)
-        
-        else:
-            return Response(
-                {"error": "Please provide either conversation_id or asset_id as query parameters."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+                if not convs.exists():
+                    return {'data': [], 'msg_count': 0, 'cached_at': now, 'has_processing': False}
 
-    def _invalidate_conversation_cache(self, conversation_id):
-        """Invalidate the cache for a specific conversation"""
-        cache_key = f"chat_history_conversation_{conversation_id}"
-        cache.delete(cache_key)
-    
-    def _invalidate_asset_cache(self, asset_id):
-        """Invalidate the cache for an asset"""
-        cache_key = f"chat_history_asset_{asset_id}"
-        cache.delete(cache_key)
-        cache.delete(f"{cache_key}_created_at")
+                all_pairs = []
+                has_proc = False
+                total_count = 0
+                for conv in convs:
+                    total_count += conv.msg_count
+                    if any(m.processing_status in ['pending','processing'] for m in conv.ordered_messages if not m.is_user):
+                        has_proc = True
+                    all_pairs.extend(fetch_pairs_for_conversation(conv))
+                serialized = MessagePairSerializer(all_pairs, many=True).data
+                return {'data': serialized, 'msg_count': total_count, 'cached_at': timezone.now(), 'has_processing': has_proc}
+
+            cached = cache.get(cache_key)
+            latest_update = (
+                Conversation.objects.filter(asset_id=asset_id)
+                .aggregate(max=Max('updated_at'))['max']
+            )
+            cache_ts = cache.get(f"{cache_key}_created_at")
+
+            if cached and cache_ts and latest_update and cache_ts >= latest_update and not cached['has_processing']:
+                return Response(cached['data'])
+
+            built = build_asset_data()
+            if not built['has_processing']:
+                cache.set(cache_key, built, timeout=CACHE_TIMEOUT)
+                cache.set(f"{cache_key}_created_at", built['cached_at'], timeout=CACHE_TIMEOUT)
+
+            return Response(built['data'])
+
+        return Response({
+            'error': 'Please provide either conversation_id or asset_id as query parameters.'
+        }, status=status.HTTP_400_BAD_REQUEST)
