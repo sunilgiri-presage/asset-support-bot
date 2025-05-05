@@ -305,7 +305,7 @@ Instructions:
         enhanced_prompt = prompt + "\n\nIMPORTANT: Return your response as valid JSON only, not wrapped in markdown code blocks or any other formatting."
         
         # Pass both user message and prompt as a list of messages
-        response_text = mistral_client.generate_response(
+        response_text = mistral_client.generate_response_v2(
             prompt=enhanced_prompt,  # Use enhanced prompt for better JSON compliance
             context=user_message_content  # Pass user message as context
         )
@@ -434,6 +434,7 @@ Instructions:
 def perform_vibration_analysis_structured(data, user_message_content):
     import json
     import logging
+    import re
     
     logger = logging.getLogger(__name__)
     
@@ -548,22 +549,30 @@ No markdown, no code fences, no extra text.
     from chatbot.utils.mistral_client import MistralLLMClient
     mistral_client = MistralLLMClient()
     try:
-        response_text = mistral_client.generate_response(
+        response_text = mistral_client.generate_response_v2(
             prompt=super_prompt,
             context=user_message_content
         )
         
         # Extract JSON substring between first '{' and last '}'
-        start = response_text.find('{')
-        end = response_text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            json_str = response_text[start:end+1]
-            return json.loads(json_str)
+        json_match = re.search(r'(\{[\s\S]*\})', response_text)
+        if json_match:
+            json_str = json_match.group(1)
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                # If we still can't parse the JSON, let's try to clean it up more aggressively
+                logger.warning("Failed to parse JSON response, attempting cleanup")
+                # Remove any non-JSON content that might be wrapped around the response
+                clean_json = re.sub(r'^[^{]*', '', json_str)
+                clean_json = re.sub(r'[^}]*$', '', clean_json)
+                return json.loads(clean_json)
         else:
             raise ValueError("No valid JSON object found in LLM response")
 
     except Exception as e:
         logger.error(f"Structured analysis failed: {e}")
+        logger.error(f"Raw response: {response_text if 'response_text' in locals() else 'No response'}")
         # Fallback minimal structure
         return {
             "overview": "Error encountered during analysis.",
