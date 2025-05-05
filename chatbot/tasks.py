@@ -47,7 +47,7 @@ def process_fetch_data(message_id, asset_id, user_message_content, authorization
                 headers['X-User-ID'] = x_user_id
 
             # Fetch data from API
-            api_url = f"http://192.168.1.36:8090/api/asset-data/{asset_id}/"
+            api_url = f"https://processor.presageinsights.ai/api/api/asset-data/{asset_id}/"
             response = requests.get(api_url, headers=headers, timeout=120)  # Added timeout
             
             if response.status_code == 200:
@@ -111,13 +111,17 @@ def process_fetch_data(message_id, asset_id, user_message_content, authorization
 
                     # Format the response
                     formatting_prompt = f"""
-                    Format the following vibration analysis results into a user-friendly HTML response.
-                    Organize with headings, bullet points, and highlight important findings.
-                    Include the asset ID: {asset_id} in your response.
-                    
-                    Analysis data: {json.dumps(analysis_result)}
-                    
-                    User query: {user_message_content}
+                        Format the following vibration analysis results into a user-friendly HTML response.
+                        Organize with headings, bullet points, and highlight important findings.
+
+                        IMPORTANT: 
+                        - Use the asset name: "{asset_data.get('asset_name', 'Unknown')}" instead of showing the asset ID
+                        - When displaying mount information, use only the format "Mount [endpoint_name]:" without showing mount IDs
+                        - Example: "Mount timezone-test DE:" instead of "Mount timezone-test DE (Mount ID: 4407):"
+
+                        Analysis data: {json.dumps(analysis_result)}
+
+                        User query: {user_message_content}
                     """
                     formatted_response = llm_client.generate_response(prompt=formatting_prompt, context="")
                     timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
@@ -284,7 +288,8 @@ Velocity severity guidelines (in mm/s RMS):
 
 Return your analysis as a structured JSON object with the following keys:
 - "overview": A brief summary of the asset's condition.
-- "mount_analysis": A list of individual analyses for each active mount point.
+- "asset_name": The human-readable name of the asset.
+- "mount_analysis": A list of individual analyses for each active mount point, including mount_id, endpoint_name, findings, and severity.
 - "time_domain_analysis": Detailed analysis of the acceleration and velocity time waveforms across all mounts.
 - "frequency_domain_analysis": Analysis of the harmonics and cross PSD data across all mounts.
 - "bearing_faults": Analysis of any potential bearing fault frequencies detected.
@@ -411,7 +416,16 @@ Instructions:
             # Create fallback analysis
             return {
                 "overview": "Unable to parse detailed analysis results.",
-                "mount_analysis": [{"mount_id": mount.get("mount_id", "unknown"), "status": "Analysis not available"} for mount in device_mounts],
+                "asset_name": asset_name,
+                "mount_analysis": [
+                    {
+                        "mount_id": mount.get("mount_id", "unknown"), 
+                        "endpoint_name": mount.get("endpoint_name", "Unknown Endpoint"),
+                        "findings": "Analysis not available", 
+                        "severity": "Unknown"
+                    } 
+                    for mount in device_mounts
+                ],
                 "time_domain_analysis": "Analysis not available.",
                 "frequency_domain_analysis": "Analysis not available.",
                 "bearing_faults": "Analysis not available.",
@@ -423,7 +437,15 @@ Instructions:
         logger.error(f"Failed to generate vibration analysis response: {str(e)}")
         return {
             "overview": "Error encountered during analysis.",
-            "mount_analysis": [{"mount_id": mount.get("mount_id", "unknown"), "status": "Analysis error"} for mount in device_mounts],
+            "mount_analysis": [
+                {
+                    "mount_id": m.get('mount_id', 'unknown'),  # Gets the mount ID or uses 'unknown' if not found
+                    "endpoint_name": m.get('endpoint_name', 'Unknown Endpoint'),  # Gets the endpoint name
+                    "findings": "Analysis error",  # Default text if analysis fails
+                    "severity": "Unknown"  # Default severity if analysis fails
+                }
+                for m in device_mounts  # This loops through each mount in device_mounts
+            ],
             "time_domain_analysis": "Analysis not available due to technical error.",
             "frequency_domain_analysis": "Analysis not available due to technical error.",
             "bearing_faults": "Analysis not available due to technical error.",
@@ -496,7 +518,7 @@ Mount Data Summary:
         rpm = mount.get('running_RPM', 0)
         
         super_prompt += f"""
-Mount {i+1} (ID: {mount_id}, Name: {mount_name}, RPM: {rpm}):
+Mount {i+1} (ID: {mount_id}, Name: {mount.get('endpoint_name', 'Unknown Endpoint')}, RPM: {rpm}):
 """
         # Add summary for each axis
         for axis_name, axis_data in mount.get('axes', {}).items():
@@ -534,7 +556,8 @@ Instructions:
 Return ONLY valid JSON with EXACT keys:
 {
   "overview": string,
-  "mount_analysis": [ { "mount_id": int, "findings": string, "severity": string }, ... ],
+  "asset_name": string,
+  "mount_analysis": [ { "mount_id": int, "endpoint_name": string, "findings": string, "severity": string }, ... ],
   "time_domain_analysis": string,
   "frequency_domain_analysis": string,
   "bearing_faults": string,
@@ -577,7 +600,12 @@ No markdown, no code fences, no extra text.
         return {
             "overview": "Error encountered during analysis.",
             "mount_analysis": [
-                {"mount_id": m.get('mount_id', 'unknown'), "findings": "Analysis error", "severity": "Unknown"}
+                {
+                    "mount_id": m.get('mount_id', 'unknown'),
+                    "endpoint_name": m.get('endpoint_name', 'Unknown Endpoint'),
+                    "findings": "Analysis error", 
+                    "severity": "Unknown"
+                }
                 for m in device_mounts
             ],
             "time_domain_analysis": "Analysis not available.",
