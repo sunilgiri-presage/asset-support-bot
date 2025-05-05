@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-
+from corsheaders.defaults import default_headers
 # Load environment variables
 load_dotenv()
 
@@ -49,7 +49,6 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOWED_ORIGINS = [
     "http://ml.presageinsights.ai",
     "https://ml.presageinsights.ai",
@@ -57,6 +56,9 @@ CORS_ALLOWED_ORIGINS = [
     "https://13.201.85.22",
     "http://127.0.0.1",
 ]
+
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOW_METHODS = [
     'DELETE',
@@ -67,7 +69,7 @@ CORS_ALLOW_METHODS = [
     'PUT',
 ]
 
-CORS_ALLOW_HEADERS = [
+CORS_ALLOW_HEADERS =  list(default_headers) + [
     'accept',
     'accept-encoding',
     'authorization',
@@ -77,6 +79,12 @@ CORS_ALLOW_HEADERS = [
     'user-agent',
     'x-csrftoken',
     'x-requested-with',
+    'x-user-id',
+]
+
+CORS_EXPOSE_HEADERS = [
+    'Authorization',
+    'X-User-ID',
 ]
 
 ROOT_URLCONF = 'asset_support_bot.urls'
@@ -167,6 +175,9 @@ CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 REDIS_HOST = os.environ.get('REDIS_HOST', 'asset-support-bot-redis-1')
 REDIS_PORT = os.environ.get('REDIS_PORT', '6379')
 # Document upload settings

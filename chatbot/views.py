@@ -84,6 +84,9 @@ class ChatbotViewSet(viewsets.ViewSet):
         use_search = serializer.validated_data.get('use_search', False)
         timings = {}
 
+        authorization = request.headers.get('Authorization')
+        x_user_id = request.headers.get('X-User-ID')
+
         try:
             # Get or create the conversation
             conv_start = time.perf_counter()
@@ -98,6 +101,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                 content=message_content
             )
             timings['user_message_time'] = f"{time.perf_counter() - user_msg_start:.2f} seconds"
+            
             basic_greetings = {"hi", "hii", "hello", "hey", "hlo", "h", "hh", "hiii", "helloo", "helo", "hilo", "hellooo"}
             gratitude_keywords = {"thank", "thanks", "thank you", "thankyou", "tq", "tqs"}
             # 2. Normalize incoming message
@@ -116,7 +120,7 @@ class ChatbotViewSet(viewsets.ViewSet):
             elif content in gratitude_keywords:
                 hardcoded_response = (
                     '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
-                    '<p>You’re very welcome! If there’s anything else you need, just let me know.</p>'
+                    "<p>You're very welcome! If there's anything else you need, just let me know.</p>"
                     '</div>'
                 )
                 is_hardcoded = True
@@ -161,40 +165,69 @@ class ChatbotViewSet(viewsets.ViewSet):
 
             # Step 2: Handle the query based on the determined action type
             response_content = ""
-
-            if action_type == "document_query":
-                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
-            elif action_type == "fetch_data":
-                response_content = self._handle_fetch_data(asset_id, message_content, timings)
-            elif action_type == "web_search":
-                response_content = self._handle_web_search(message_content,conversation, timings)
-            else:
-                logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
-                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
-
-            # Save the assistant's response
-            assist_msg_start = time.perf_counter()
+            
+            # Create initial assistant message
             system_message = Message.objects.create(
                 conversation=conversation,
                 is_user=False,
-                content=response_content
+                processing_status="pending",
+                content="Preparing response..."
             )
-            timings['assistant_message_save_time'] = f"{time.perf_counter() - assist_msg_start:.2f} seconds"
 
-            # Summarize conversation for history management - USING MISTRAL
-            mistral_client = MistralLLMClient()
-            summary_prompt = (
-                "Summarize the following conversation in 2-3 lines, capturing the key points:\n\n"
-                f"User: {message_content}\n"
-                f"Assistant: {response_content}"
-            )
-            new_summary = mistral_client.generate_response(prompt=summary_prompt, context="")
-
-            if conversation.summary:
-                conversation.summary += "\n" + new_summary
+            if action_type == "document_query":
+                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
+                system_message.content = response_content
+                system_message.processing_status = "completed"
+                system_message.save(update_fields=['content', 'processing_status'])
+            elif action_type == "fetch_data":              
+                # Create initial processing message
+                initial_message = (
+                    '<div class="processing-message" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                    '<p>Processing your request. This may take a moment as we fetch and analyze the vibration data for '
+                    f'asset {asset_id}. Please check back in a few moments or refresh the page to see the results.</p>'
+                    '</div>'
+                )
+                system_message.content = initial_message
+                system_message.save(update_fields=['content'])
+                from chatbot.tasks import process_fetch_data
+                # Start background task to process the data
+                process_fetch_data.delay(str(system_message.id), asset_id, message_content, authorization, x_user_id)
+                
+                # Set response content to the initial message for the response
+                response_content = initial_message
+            elif action_type == "web_search":
+                response_content = self._handle_web_search(message_content, conversation, timings)
+                system_message.content = response_content
+                system_message.processing_status = "completed"
+                system_message.save(update_fields=['content', 'processing_status'])
             else:
-                conversation.summary = new_summary
-            conversation.save()
+                logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
+                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
+                system_message.content = response_content
+                system_message.processing_status = "completed"
+                system_message.save(update_fields=['content', 'processing_status'])
+
+            # Only summarize conversation if we're not doing background processing
+            if action_type != "fetch_data":
+                # Summarize conversation for history management - USING MISTRAL
+                assist_msg_start = time.perf_counter()
+                mistral_client = MistralLLMClient()
+                summary_prompt = (
+                    "Summarize the following conversation in 2-3 lines, capturing the key points:\n\n"
+                    f"User: {message_content}\n"
+                    f"Assistant: {response_content}"
+                )
+                new_summary = mistral_client.generate_response(prompt=summary_prompt, context="")
+                timings['assistant_message_save_time'] = f"{time.perf_counter() - assist_msg_start:.2f} seconds"
+
+                if conversation.summary:
+                    conversation.summary += "\n" + new_summary
+                else:
+                    conversation.summary = new_summary
+                conversation.save()
+            else:
+                # For background tasks, we'll update the summary when the task is complete
+                pass
 
             overall_elapsed = time.perf_counter() - overall_start
             timings['total_time'] = f"{overall_elapsed:.2f} seconds"
@@ -205,7 +238,8 @@ class ChatbotViewSet(viewsets.ViewSet):
                 "assistant_message": MessageSerializer(system_message).data,
                 "action_type": action_type,
                 "response_time": f"{overall_elapsed:.2f} seconds",
-                "timings": timings
+                "timings": timings,
+                "background_processing": action_type == "fetch_data"
             }
 
             return Response(response_data)
@@ -384,68 +418,6 @@ class ChatbotViewSet(viewsets.ViewSet):
         timings['successful_llm'] = successful_llm or "None"
         
         return response_content
-    
-    def _handle_fetch_data(self, asset_id, message_content, timings):
-        logger.info(f"Handling fetch data request for asset_id: {asset_id}")
-        
-        api_start = time.perf_counter()
-        try:
-            api_url = f"/api/asset-data/{asset_id}/"
-            response = requests.get(api_url)
-            
-            if response.status_code == 200:
-                asset_data = response.json()
-                logger.info(f"Successfully fetched data for asset: {asset_id}")
-                
-                analysis_data = {
-                    "asset_type": asset_data.get("asset_type", "Unknown"),
-                    "running_RPM": asset_data.get("running_RPM", 0),
-                    "bearing_fault_frequencies": asset_data.get("bearing_fault_frequencies", {}),
-                    "acceleration_time_waveform": asset_data.get("acceleration_time_waveform", {}),
-                    "velocity_time_waveform": asset_data.get("velocity_time_waveform", {}),
-                    "harmonics": asset_data.get("harmonics", {}),
-                    "cross_PSD": asset_data.get("cross_PSD", {})
-                }
-                
-                serializer = VibrationAnalysisInputSerializer(data=analysis_data)
-                if serializer.is_valid():
-                    analysis_result = self._perform_vibration_analysis(serializer.validated_data)
-                    
-                    analysis_str = json.dumps(analysis_result)
-                    # Choose LLM client based on complexity of analysis_result
-                    if len(analysis_str.split()) > 300:
-                        llm_client = GeminiLLMClient()
-                        logger.info("Using GeminiLLMClient for fetch_data (complex analysis).")
-                    else:
-                        llm_client = GroqLLMClient()
-                        logger.info("Using GroqLLMClient for fetch_data.")
-
-                    formatting_prompt = f"""
-                    Format the following vibration analysis results into a user-friendly HTML response.
-                    Organize with headings, bullet points, and highlight important findings.
-                    Include the asset ID: {asset_id} in your response.
-                    
-                    Analysis data: {json.dumps(analysis_result)}
-                    
-                    User query: {message_content}
-                    """
-                    formatted_response = llm_client.generate_response(prompt=formatting_prompt, context="")
-                    timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
-                    return formatted_response
-                else:
-                    error_msg = f"Invalid data format for vibration analysis: {serializer.errors}"
-                    logger.error(error_msg)
-                    return f"<div class='error-message'>Unable to analyze data for asset {asset_id}. The data format is invalid.</div>"
-            else:
-                error_msg = f"Failed to fetch data for asset {asset_id}. Status code: {response.status_code}"
-                logger.error(error_msg)
-                return f"<div class='error-message'>Unable to fetch data for asset {asset_id}. Please check if the asset ID is correct.</div>"
-                
-        except Exception as e:
-            error_msg = f"Error fetching or analyzing data for asset {asset_id}: {str(e)}"
-            logger.error(error_msg)
-            timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
-            return f"<div class='error-message'>An error occurred while processing data for asset {asset_id}: {str(e)}</div>"
 
     def _handle_web_search(self, message_content,conversation, timings):
         logger.info(f"Handling web search for query: {message_content}")
@@ -553,50 +525,6 @@ class ChatbotViewSet(viewsets.ViewSet):
                 '</div>'
             )
             return error_response
-
-    def _perform_vibration_analysis(self, data):
-        prompt = f"""
-You are a level 3 vibration analyst.
-Perform a comprehensive analysis of the asset's condition using the provided data.
-Return your analysis as a structured JSON object with the following keys:
-- "overview": A brief summary of the asset's condition.
-- "time_domain_analysis": Detailed analysis of the acceleration and velocity time waveforms.
-- "frequency_domain_analysis": Analysis of the harmonics and cross PSD data.
-- "bearing_faults": Analysis of the bearing fault frequencies.
-- "recommendations": A list of actionable maintenance recommendations.
-
-Data:
-{{
-  "asset_type": "{data['asset_type']}",
-  "running_RPM": {data['running_RPM']},
-  "bearing_fault_frequencies": {data['bearing_fault_frequencies']},
-  "acceleration_time_waveform": {data['acceleration_time_waveform']},
-  "velocity_time_waveform": {data['velocity_time_waveform']},
-  "harmonics": {data['harmonics']},
-  "cross_PSD": {data['cross_PSD']}
-}}
-
-Instructions:
-- Provide a concise overview.
-- Include detailed analysis for time and frequency domains.
-- Mention any bearing faults if present.
-- List clear maintenance recommendations.
-- Return only valid JSON.
-"""
-        mistral_client = MistralLLMClient()
-        response_text = mistral_client.query_llm([
-            {"role": "user", "content": prompt}
-        ])
-
-        try:
-            analysis_data = json.loads(response_text)
-            return analysis_data
-        except Exception as e:
-            logger.error(f"Failed to parse vibration analysis response: {str(e)}")
-            return {
-                "error": "Failed to parse analysis results",
-                "raw_response": response_text
-            }
 
     def _get_or_create_conversation(self, conversation_id, asset_id):
         # Use cache to avoid repeated DB queries
@@ -901,13 +829,6 @@ Instructions:
             return " ".join(tech_terms if tech_terms else words[:8])
         return query
 
-    def _text_similarity(self, text1, text2):
-        """Calculate simple text similarity ratio"""
-        # Simple implementation - can be improved with better algorithms
-        common_words = set(text1.lower().split()) & set(text2.lower().split())
-        all_words = set(text1.lower().split()) | set(text2.lower().split())
-        return len(common_words) / len(all_words) if all_words else 0
-
     def _get_cached_or_build_conversation_context(self, conversation, current_query):
         """Gets conversation context from cache or builds it if not available"""
         cache_key = f"conversation_context_{conversation.id}_{hash(current_query)}"
@@ -1126,32 +1047,43 @@ Instructions:
             return pairs
 
         # only fetch the fields we actually use
-        message_qs = Message.objects.only('id', 'is_user', 'content', 'created_at')
+        message_qs = Message.objects.only('id', 'is_user', 'content', 'created_at', 'processing_status')
 
         if conversation_id:
             cache_key = f"chat_history_conversation_{conversation_id}"
             
-            # Try to get from cache first
-            cached = cache.get(cache_key)
+            # Check if there are any processing messages
+            has_processing = message_qs.filter(
+                conversation__id=conversation_id, 
+                is_user=False, 
+                processing_status__in=["pending", "processing"]
+            ).exists()
             
-            # Check if we should invalidate cache - get latest message timestamp
-            if cached:
-                conversation = get_object_or_404(Conversation, id=conversation_id)
-                latest_message = message_qs.filter(conversation=conversation).order_by('-created_at').first()
+            # If there are processing messages, don't use cache
+            if has_processing:
+                cached = None
+            else:
+                # Try to get from cache first
+                cached = cache.get(cache_key)
                 
-                # If there's no latest message in the DB or cached data is empty, invalidate
-                if not latest_message or not cached:
-                    cached = None
-                else:
-                    # Check if our cached data includes all messages by comparing counts
-                    msg_count = message_qs.filter(conversation=conversation).count()
+                # Check if we should invalidate cache - get latest message timestamp
+                if cached:
+                    conversation = get_object_or_404(Conversation, id=conversation_id)
+                    latest_message = message_qs.filter(conversation=conversation).order_by('-created_at').first()
                     
-                    # Calculate message count in cached data
-                    cached_msg_count = sum(1 for pair in cached if pair.get('user_message')) + \
-                                      sum(1 for pair in cached if pair.get('system_message'))
-                    
-                    if cached_msg_count != msg_count:
+                    # If there's no latest message in the DB or cached data is empty, invalidate
+                    if not latest_message or not cached:
                         cached = None
+                    else:
+                        # Check if our cached data includes all messages by comparing counts
+                        msg_count = message_qs.filter(conversation=conversation).count()
+                        
+                        # Calculate message count in cached data
+                        cached_msg_count = sum(1 for pair in cached if pair.get('user_message')) + \
+                                        sum(1 for pair in cached if pair.get('system_message'))
+                        
+                        if cached_msg_count != msg_count:
+                            cached = None
 
             if not cached:
                 conversation = get_object_or_404(Conversation, id=conversation_id)
@@ -1161,7 +1093,11 @@ Instructions:
                 
                 serializer = MessagePairSerializer(message_pairs, many=True)
                 data = serializer.data
-                cache.set(cache_key, data, timeout=cache_timeout)
+                
+                # Only cache if there are no processing messages
+                if not has_processing:
+                    cache.set(cache_key, data, timeout=cache_timeout)
+                    
                 return Response(data)
             
             return Response(cached)
@@ -1169,25 +1105,36 @@ Instructions:
         elif asset_id:
             cache_key = f"chat_history_asset_{asset_id}"
             
-            # Try to get from cache first
-            cached = cache.get(cache_key)
+            # Check if there are any processing messages for this asset
+            has_processing = message_qs.filter(
+                conversation__asset_id=asset_id, 
+                is_user=False, 
+                processing_status__in=["pending", "processing"]
+            ).exists()
             
-            # Check if we should invalidate cache
-            if cached:
-                # Get all conversations for this asset
-                conversations = Conversation.objects.filter(asset_id=asset_id)
+            # If there are processing messages, don't use cache
+            if has_processing:
+                cached = None
+            else:
+                # Try to get from cache first
+                cached = cache.get(cache_key)
                 
-                if not conversations.exists() or not cached:
-                    cached = None
-                else:
-                    # Get the latest update time across all conversations
-                    latest_update = conversations.aggregate(Max('updated_at'))['updated_at__max']
+                # Check if we should invalidate cache
+                if cached:
+                    # Get all conversations for this asset
+                    conversations = Conversation.objects.filter(asset_id=asset_id)
                     
-                    # Check if we have new conversations or messages since the cache was created
-                    cache_created_time = cache.get(f"{cache_key}_created_at")
-                    
-                    if not cache_created_time or latest_update and latest_update > cache_created_time:
+                    if not conversations.exists() or not cached:
                         cached = None
+                    else:
+                        # Get the latest update time across all conversations
+                        latest_update = conversations.aggregate(Max('updated_at'))['updated_at__max']
+                        
+                        # Check if we have new conversations or messages since the cache was created
+                        cache_created_time = cache.get(f"{cache_key}_created_at")
+                        
+                        if not cache_created_time or latest_update and latest_update > cache_created_time:
+                            cached = None
             
             if not cached:
                 conversations = (
@@ -1211,10 +1158,13 @@ Instructions:
                 serializer = MessagePairSerializer(all_message_pairs, many=True)
                 data = serializer.data
                 
-                # Store cache with creation timestamp
-                now = timezone.now()
-                cache.set(cache_key, data, timeout=cache_timeout)
-                cache.set(f"{cache_key}_created_at", now, timeout=cache_timeout)
+                # Only cache if there are no processing messages
+                if not has_processing:
+                    # Store cache with creation timestamp
+                    now = timezone.now()
+                    cache.set(cache_key, data, timeout=cache_timeout)
+                    cache.set(f"{cache_key}_created_at", now, timeout=cache_timeout)
+                    
                 return Response(data)
             
             return Response(cached)
