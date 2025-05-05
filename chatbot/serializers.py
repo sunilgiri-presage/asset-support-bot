@@ -10,19 +10,19 @@ class MessageSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 class ConversationSerializer(serializers.ModelSerializer):
-    """Original serializer for conversations"""
-    messages = MessageSerializer(many=True, read_only=True)
-    
     class Meta:
         model = Conversation
-        fields = ['id', 'asset_id', 'messages', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        fields = ['id', 'asset_id', 'summary', 'created_at', 'updated_at']
+
+class MessagePairSerializer(serializers.Serializer):
+    conversation = ConversationSerializer()
+    user_message = MessageSerializer(allow_null=True)
+    system_message = MessageSerializer(allow_null=True)
 
 class QuerySerializer(serializers.Serializer):
-    """Serializer for chat queries"""
     asset_id = serializers.CharField(required=True)
     message = serializers.CharField(required=True)
-    conversation_id = serializers.UUIDField(required=False)
+    conversation_id = serializers.UUIDField(required=False, allow_null=True)
     use_search = serializers.BooleanField(required=False, default=False)
 
 class MessagePairSerializer(serializers.Serializer):
@@ -54,12 +54,12 @@ class MessagePairSerializer(serializers.Serializer):
             })
         
         return messages
-    
+
 class VibrationAnalysisInputSerializer(serializers.Serializer):
-    asset_type = serializers.CharField()
-    running_RPM = serializers.FloatField()
-    bearing_fault_frequencies = serializers.DictField(child=serializers.FloatField())
-    acceleration_time_waveform = serializers.DictField()
-    velocity_time_waveform = serializers.DictField()
-    harmonics = serializers.DictField()
-    cross_PSD = serializers.DictField()
+    asset_type = serializers.CharField(allow_blank=True, default="Unknown")
+    running_RPM = serializers.FloatField(default=0)
+    bearing_fault_frequencies = serializers.DictField(default=dict)
+    acceleration_time_waveform = serializers.DictField(default=dict)
+    velocity_time_waveform = serializers.DictField(default=dict)
+    harmonics = serializers.DictField(default=dict)
+    cross_PSD = serializers.ListField(default=list)

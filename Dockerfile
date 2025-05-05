@@ -1,6 +1,8 @@
 # Dockerfile (for web service)
 FROM python:3.12-slim
 
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
@@ -8,6 +10,8 @@ WORKDIR /app
 
 # Install system dependencies if needed (e.g., gcc, libpq-dev)
 RUN apt-get update && apt-get install -y build-essential
+
+RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 
 # Install Python dependencies
 COPY requirements.txt /app/

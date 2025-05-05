@@ -1,8 +1,8 @@
-accelerate==1.5.2
+# Removed: accelerate==1.5.2 (GPU/distributed focus)
 amqp==5.3.1
 asgiref==3.8.1
 billiard==4.2.1
-bitsandbytes==0.45.3
+# Removed: bitsandbytes==0.45.3 (GPU quantization)
 celery==5.4.0
 certifi==2025.1.31
 charset-normalizer==3.4.1
@@ -45,17 +45,17 @@ requests==2.32.3
 safetensors==0.5.3
 scikit-learn==1.6.1
 scipy==1.15.2
-sentence-transformers==3.4.1
+sentence-transformers==3.4.1 # Needs torch
 setuptools==67.6.0
 six==1.17.0
 sqlparse==0.5.3
 sympy==1.13.1
 threadpoolctl==3.6.0
 tika==2.6.0
-tokenizers==0.21.1
-torch==2.6.0
+tokenizers==0.21.1 # Often used with transformers
+# Removed: torch==2.6.0 (Install CPU version separately)
 tqdm==4.67.1
-transformers==4.50.0
+transformers==4.50.0 # Needs torch
 typing_extensions==4.12.2
 tzdata==2025.1
 urllib3==2.3.0

@@ -135,10 +135,10 @@ class GroqLLMClient:
             
         try:
             # First get an outline of the response structure
-            outline_response = self._get_outline(prompt, context)
+            # outline_response = self._get_outline(prompt, context)
             
             # Then get the full response with the outline as a guide
-            full_response = self._get_full_response(prompt, outline_response, context, max_length)
+            full_response = self._get_full_response(prompt, context, max_length)
             
             # Clean up and check the HTML structure
             html_response = self._clean_html(full_response)
@@ -218,31 +218,32 @@ class GroqLLMClient:
             # Return a basic outline if outline generation fails
             return "<h6>Topic Overview</h6><ul><li>Key points</li></ul><h6>Details</h6><ul><li>Important details</li></ul><h6>Conclusion</h6><ul><li>Summary points</li></ul>"
 
-    def _get_full_response(self, prompt, outline, context=None, max_length=800):
+    def _get_full_response(self, prompt, context=None, max_length=800):
         # Domain expert instructions for the Presage Insights platform
-        domain_expert_instructions = (
-            "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
-            "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
-        )
-        
-        # Enhanced system prompt with structured response instructions
+        if "Web Search Results:" in context:
+            # For web search queries
+            domain_expert_instructions = (
+                "You are Presage Insights' AI assistant. When web search results are provided, use them to answer the user's question. "
+                "Synthesize information from the search results to give accurate, helpful responses. "
+                "Be direct and comprehensive. Format your response with appropriate HTML for readability. "
+                "If the search results don't contain enough information to answer the question fully, state what you can determine "
+                "from the results and acknowledge any limitations."
+            )
+        else:
+            # For document queries (original behavior)
+            domain_expert_instructions = (
+                "You are a document retrieval assistant. Your primary task is to answer user questions based on the supplied document whenever possible. "
+                "First, carefully check if the document contains information relevant to the question. "
+                "If the document contains relevant information, use only that information to construct your answer. "
+                "If the document does not contain relevant information, or if the information is insufficient, you may use your own general knowledge to provide the best possible answer."
+            )
+
         system_content = (
-            "You are a precise, professional technical support assistant for the Presage Insights platform. "
-            f"Follow this outline for your response structure: \n\n{outline}\n\n"
-            "CRITICAL FORMATTING REQUIREMENTS:\n"
-            "1. Format your ENTIRE response as clean HTML with NO markdown.\n"
-            "2. Start with <div class='response-container'> and end with </div>\n"
-            "3. Use appropriate HTML tags: <p> for paragraphs, <h6> for headings, <strong> for emphasis\n"  # Changed from h3 to h6
-            "4. Use proper HTML lists: <ul><li> for bullet points and <ol><li> for numbered lists\n"
-            "5. For nested lists, place the entire <ul> or <ol> inside the parent <li> element\n"
-            "6. DO NOT exceed the token limit - prioritize completing all sections over verbosity\n"
-            "7. ALWAYS end with a proper conclusion paragraph\n"
-            "8. NEVER leave a tag unclosed or a sentence unfinished\n"
-            "9. ALWAYS ensure your response follows a clear logical structure with a beginning, middle, and end\n"
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response. "
+            "Ensure the entire output starts with '<div class=\"response-container\">' and ends with '</div>', uses proper HTML tags (<p>, <h6>, <strong>) and lists (<ul>/<ol>), "
+            "and is entirely valid with all tags closed. The response must be concise with a clear introduction, body, and conclusion, "
+            "and integrate the following domain expertise:\n\n" + domain_expert_instructions
         )
-        
-        # Append domain expert instructions
-        system_content += domain_expert_instructions
         
         # Include context if provided
         if context:
@@ -265,8 +266,6 @@ class GroqLLMClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
-        
-        logger.info("Generating full response with outline guidance...")
         
         response = requests.post(
             self.base_url,
@@ -291,6 +290,17 @@ class GroqLLMClient:
     
 
     def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
+        logger.info("Querying Groq LLM directly...")
+
+        # Ensure there is at least one user message
+        if not messages or not any(m.get('role') == 'user' for m in messages):
+            logger.error("query_llm requires at least one user message")
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Error:</strong> No user message provided. Please retry with a valid query.</p>'
+                '</div>'
+            )
+
         payload = {
             "model": self.model,
             "messages": messages,
@@ -304,8 +314,7 @@ class GroqLLMClient:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logger.info("Querying Groq LLM directly...")
-
+        # Send the request
         try:
             response = requests.post(
                 self.base_url,
@@ -313,23 +322,56 @@ class GroqLLMClient:
                 headers=headers,
                 timeout=(10, 120)
             )
-
             response.raise_for_status()
-            result = response.json()
-            reply = result['choices'][0]['message']['content'].strip()
-
-            logger.info("Received response from LLM.")
-            return reply
-
         except requests.Timeout:
             logger.error("Groq LLM request timed out")
-            return "Request timed out. Please try again."
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Timeout:</strong> The request took too long. Please try again later.</p>'
+                '</div>'
+            )
         except requests.RequestException as e:
-            logger.error(f"Groq LLM request failed: {str(e)}")
-            return "Request failed. Please check logs."
-        except KeyError as e:
-            logger.error(f"Unexpected response format: {str(e)}")
-            return "Unexpected error occurred while parsing the LLM response."
+            status = getattr(e.response, 'status_code', 'N/A')
+            text = getattr(e.response, 'text', str(e))
+            logger.error(f"Groq LLM request failed: HTTP {status} - {text}")
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p><strong>API Error (Status {status}):</strong> {text}</p>'
+                '<p>Please check your API key, network connection, and try again.</p>'
+                '</div>'
+            )
+
+        # Parse and validate the response
+        try:
+            result = response.json()
+            choices = result.get('choices', [])
+            if not choices or 'message' not in choices[0] or 'content' not in choices[0]['message']:
+                raise KeyError("Missing choice content")
+
+            reply = choices[0]['message']['content'].strip()
+        except (ValueError, KeyError) as e:
+            logger.error(f"Parse error from Groq response: {e} -- full response: {response.text}")
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Response Format Error:</strong> Unexpected format from Groq. '
+                'Please try again or contact support if this persists.</p>'
+                '</div>'
+            )
         except Exception as e:
-            logger.error(f"General error in query_llm: {str(e)}")
-            return "Unexpected error. Please try again later."
+            logger.error(f"Unexpected error parsing Groq response: {e}", exc_info=True)
+            return (
+                '<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Error:</strong> An unexpected error occurred. Please try again later.</p>'
+                '</div>'
+            )
+
+        # Wrap plain text in a container if needed
+        if not reply.startswith('<div class="response-container"'):
+            reply = (
+                '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p>{reply}</p>'
+                '</div>'
+            )
+
+        logger.info("Received response from Groq LLM.")
+        return reply

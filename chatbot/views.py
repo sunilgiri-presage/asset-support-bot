@@ -5,7 +5,7 @@ import time
 import concurrent.futures
 import logging
 from rest_framework import viewsets, status
-from rest_framework.decorators import action, api_view
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 from chatbot.models import Conversation, Message
@@ -21,6 +21,9 @@ from chatbot.utils.gemini_client import GeminiLLMClient
 import requests
 from rest_framework.permissions import AllowAny
 from django.core.cache import cache
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from django.db.models import Max, Prefetch
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -81,6 +84,9 @@ class ChatbotViewSet(viewsets.ViewSet):
         use_search = serializer.validated_data.get('use_search', False)
         timings = {}
 
+        authorization = request.headers.get('Authorization')
+        x_user_id = request.headers.get('X-User-ID')
+
         try:
             # Get or create the conversation
             conv_start = time.perf_counter()
@@ -95,15 +101,35 @@ class ChatbotViewSet(viewsets.ViewSet):
                 content=message_content
             )
             timings['user_message_time'] = f"{time.perf_counter() - user_msg_start:.2f} seconds"
-
-            # Check if the incoming message is a basic greeting
+            
             basic_greetings = {"hi", "hii", "hello", "hey", "hlo", "h", "hh", "hiii", "helloo", "helo", "hilo", "hellooo"}
-            if message_content.strip().lower() in basic_greetings:
+            gratitude_keywords = {"thank", "thanks", "thank you", "thankyou", "tq", "tqs"}
+            # 2. Normalize incoming message
+            content = message_content.strip().lower()
+            # 3. Check for greetings
+            if content in basic_greetings:
                 hardcoded_response = (
                     '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
-                    '<p>Hello! How can I help you today with Presage Insights? I can assist with predictive maintenance, IoT sensor data, or analytics questions.</p>'
+                    '<p>Hello! How can I help you today with Presage Insights? I can assist with predictive maintenance, '
+                    'IoT sensor data, or analytics questions.</p>'
                     '</div>'
                 )
+                is_hardcoded = True
+
+            # 4. Check for thanks/gratitude
+            elif content in gratitude_keywords:
+                hardcoded_response = (
+                    '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                    "<p>You're very welcome! If there's anything else you need, just let me know.</p>"
+                    '</div>'
+                )
+                is_hardcoded = True
+
+            else:
+                is_hardcoded = False
+
+            # 5. If we matched one of the hard‐coded cases, return immediately
+            if is_hardcoded:
                 system_message = Message.objects.create(
                     conversation=conversation,
                     is_user=False,
@@ -139,42 +165,69 @@ class ChatbotViewSet(viewsets.ViewSet):
 
             # Step 2: Handle the query based on the determined action type
             response_content = ""
-
-            if action_type == "document_query":
-                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
-            elif action_type == "fetch_data":
-                response_content = self._handle_fetch_data(asset_id, message_content, timings)
-            elif action_type == "web_search":
-                response_content = self._handle_web_search(message_content, timings)
-            elif action_type == "conversation_recall":
-                response_content = self._handle_conversation_recall(message_content, asset_id, conversation, timings)
-            else:
-                logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
-                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
-
-            # Save the assistant's response
-            assist_msg_start = time.perf_counter()
+            
+            # Create initial assistant message
             system_message = Message.objects.create(
                 conversation=conversation,
                 is_user=False,
-                content=response_content
+                processing_status="pending",
+                content="Preparing response..."
             )
-            timings['assistant_message_save_time'] = f"{time.perf_counter() - assist_msg_start:.2f} seconds"
 
-            # Summarize conversation for history management - USING MISTRAL
-            mistral_client = MistralLLMClient()
-            summary_prompt = (
-                "Summarize the following conversation in 2-3 lines, capturing the key points:\n\n"
-                f"User: {message_content}\n"
-                f"Assistant: {response_content}"
-            )
-            new_summary = mistral_client.generate_response(prompt=summary_prompt, context="")
-
-            if conversation.summary:
-                conversation.summary += "\n" + new_summary
+            if action_type == "document_query":
+                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
+                system_message.content = response_content
+                system_message.processing_status = "completed"
+                system_message.save(update_fields=['content', 'processing_status'])
+            elif action_type == "fetch_data":              
+                # Create initial processing message
+                initial_message = (
+                    '<div class="processing-message" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                    '<p>Processing your request. This may take a moment as we fetch and analyze the vibration data for '
+                    f'asset {asset_id}. Please check back in a few moments or refresh the page to see the results.</p>'
+                    '</div>'
+                )
+                system_message.content = initial_message
+                system_message.save(update_fields=['content'])
+                from chatbot.tasks import process_fetch_data
+                # Start background task to process the data
+                process_fetch_data.delay(str(system_message.id), asset_id, message_content, authorization, x_user_id)
+                
+                # Set response content to the initial message for the response
+                response_content = initial_message
+            elif action_type == "web_search":
+                response_content = self._handle_web_search(message_content, conversation, timings)
+                system_message.content = response_content
+                system_message.processing_status = "completed"
+                system_message.save(update_fields=['content', 'processing_status'])
             else:
-                conversation.summary = new_summary
-            conversation.save()
+                logger.warning(f"Unrecognized action type: {action_type}. Defaulting to document query.")
+                response_content = self._handle_document_query(message_content, asset_id, conversation, timings)
+                system_message.content = response_content
+                system_message.processing_status = "completed"
+                system_message.save(update_fields=['content', 'processing_status'])
+
+            # Only summarize conversation if we're not doing background processing
+            if action_type != "fetch_data":
+                # Summarize conversation for history management - USING MISTRAL
+                assist_msg_start = time.perf_counter()
+                mistral_client = MistralLLMClient()
+                summary_prompt = (
+                    "Summarize the following conversation in 2-3 lines, capturing the key points:\n\n"
+                    f"User: {message_content}\n"
+                    f"Assistant: {response_content}"
+                )
+                new_summary = mistral_client.generate_response(prompt=summary_prompt, context="")
+                timings['assistant_message_save_time'] = f"{time.perf_counter() - assist_msg_start:.2f} seconds"
+
+                if conversation.summary:
+                    conversation.summary += "\n" + new_summary
+                else:
+                    conversation.summary = new_summary
+                conversation.save()
+            else:
+                # For background tasks, we'll update the summary when the task is complete
+                pass
 
             overall_elapsed = time.perf_counter() - overall_start
             timings['total_time'] = f"{overall_elapsed:.2f} seconds"
@@ -185,7 +238,8 @@ class ChatbotViewSet(viewsets.ViewSet):
                 "assistant_message": MessageSerializer(system_message).data,
                 "action_type": action_type,
                 "response_time": f"{overall_elapsed:.2f} seconds",
-                "timings": timings
+                "timings": timings,
+                "background_processing": action_type == "fetch_data"
             }
 
             return Response(response_data)
@@ -202,47 +256,34 @@ class ChatbotViewSet(viewsets.ViewSet):
         mistral_client = MistralLLMClient()
         json_format_str = '{"action": "selected_action"}'
         prompt = f"""
-    You are a smart task routing bot analyzing user queries to determine the most appropriate action to take.
-    Your task is CRITICAL: you must correctly identify when queries should be answered from conversation history rather than external sources.
+                    Analyze the query and return ONLY the appropriate action type as JSON:
 
-    Your available actions are:
+                    1. "document_query": For most questions related to documentation, content understanding, explanations, and general knowledge requests. This is the default handler for most queries that don't explicitly require data retrieval or web search. This also handles questions about personal information previously shared.
+                    Example: "How does this code work?", "Explain machine learning concepts", "What are best practices for API design?", "Tell me about vibration analysis", or "What's my name?" 
 
-    1. "document_query": Use this for questions about technical documentation, API details, or product specifications.
-    2. "fetch_data": Use this for requests about retrieving structured data like stats, metrics, or database information.
-    3. "web_search": Use this when the query needs current information from the internet about general topics, news, or public figures.
-    4. "conversation_recall": MOST IMPORTANTLY, use this whenever:
-    - The query refers to personal information that a user likely shared earlier (names, roles, preferences, characteristics)
-    - The query asks about "me", "my", "I", or "mine" (like "my name", "my job", "my company")
-    - The query references previous conversations or shared details
-    - The query asks about specific people by name who are likely conversation participants, not public figures
-    - The query is checking if the assistant remembers something
-    - The query is following up on previously shared personal information
+                    2. "fetch_data": For requests about asset data, metrics, statistics, or charts, trends analysis.
+                    Example: "Show me data for asset 12345" or "What's the RPM of my machine?"
 
-    CRITICAL PATTERNS to identify as "conversation_recall":
-    - Queries containing "tell me about [person name]" when that person is likely a conversation participant
-    - Queries asking about someone's name, job, role, company, or personal details
-    - Queries with phrases like "who am I", "what's my name", "where do I work"
-    - Queries that seem to reference personal information previously shared
+                    3. "web_search": ONLY for queries that absolutely require real-time or online information that cannot be answered from stored document context or conversation history.
+                    Example: "What are today's cryptocurrency prices?" or "What were the results of yesterday's election?"
 
-    Remember: Document queries, web searches, and external data will NOT have information about the specific user you're talking to right now. Only conversation history has this.
+                    Instructions:
+                    - Return only a valid JSON object in exactly this format: {json_format_str}
+                    - DO NOT include any explanation or HTML.
+                    - Choose carefully - personal information queries should be handled by document_query.
 
-    Instructions:
-    - Return only a valid JSON object in exactly this format: {json_format_str}
-    - DO NOT include any explanation or HTML.
-    - Choose carefully - routing personal information queries to web_search or document_query will always give incorrect results.
-
-    User Query: "{user_query}"
-    """
+                    User Query: "{user_query}"
+                    """
         try:
             response = mistral_client.generate_response(prompt=prompt, context="")
             logger.info("Action determination response: %s", response)
 
-            match = re.search(r'\{.*?"action"\s*:\s*"(document_query|fetch_data|web_search|conversation_recall)".*?\}', response)
+            match = re.search(r'\{.*?"action"\s*:\s*"(document_query|fetch_data|web_search)".*?\}', response)
             if match:
                 action_json_str = match.group(0)
                 response_json = json.loads(action_json_str)
                 action = response_json.get('action')
-                if action in ["document_query", "fetch_data", "web_search", "conversation_recall"]:
+                if action in ["document_query", "fetch_data", "web_search"]:
                     return action
                 else:
                     logger.warning("Invalid action type received: %s. Defaulting to document_query.", action)
@@ -257,6 +298,7 @@ class ChatbotViewSet(viewsets.ViewSet):
 
     def _handle_document_query(self, message_content, asset_id, conversation, timings):
         logger.info(f"Handling document query: {message_content}")
+        
         if self._check_circuit_breaker():
             timings['circuit_breaker'] = "OPEN - preventing potential timeout"
             return (
@@ -266,246 +308,223 @@ class ChatbotViewSet(viewsets.ViewSet):
                 "</div>"
             )
         
-        # 1. PREPARE BOTH DOCUMENT AND CONVERSATION CONTEXT IN PARALLEL
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Launch document context retrieval
-            doc_context_future = executor.submit(
-                self._retrieve_document_context, 
-                message_content, 
-                asset_id
-            )
-            
-            # Launch conversation context building in parallel
-            conv_context_future = executor.submit(
-                self._get_cached_or_build_conversation_context,
-                conversation,
-                message_content
-            )
-            
-            # Wait for both with timeouts
-            try:
-                document_context, context_chunks_count = doc_context_future.result(timeout=18.0)
-                # timings['document_context_time'] = f"{document_context.running_time:.2f} seconds"
-            except concurrent.futures.TimeoutError:
-                logger.error("Document context retrieval timed out")
-                document_context = ""
-                context_chunks_count = 0
-                timings['document_context_time'] = "TIMEOUT after 18.0 seconds"
-            
-            try:
-                conversation_context = conv_context_future.result(timeout=5.0)
-                # timings['conversation_context_time'] = f"{conv_context_future.running_time:.2f} seconds"
-            except concurrent.futures.TimeoutError:
-                logger.error("Conversation context building timed out")
-                conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
-                timings['conversation_context_time'] = "TIMEOUT after 5.0 seconds"
-        
-        # 2. DETERMINE OPTIMAL CONTEXT STRATEGY BASED ON AVAILABLE DATA
-        # If document context failed but conversation context succeeded
-        if not document_context and conversation_context:
-            logger.info("Using conversation-focused context strategy (no document context)")
+        try:
+            with ThreadPoolExecutor() as executor:
+                logger.info("Starting parallel context retrieval...")
+
+                doc_future = executor.submit(self._retrieve_document_context, message_content, asset_id)
+                conv_future = executor.submit(self._get_cached_or_build_conversation_context, conversation, message_content)
+
+                try:
+                    document_context, context_chunks_count = doc_future.result(timeout=18.0)
+                    logger.info(f"Document context retrieved. Chunks count: {context_chunks_count}")
+                    logger.info(f"Document context content (preview): {document_context[:300] if document_context else 'No context found'}")
+                    timings['document_context_time'] = "Completed"
+                except TimeoutError:
+                    logger.error("Document context retrieval timed out")
+                    document_context, context_chunks_count = "", 0
+                    timings['document_context_time'] = "TIMEOUT after 18.0 seconds"
+
+                try:
+                    conversation_context = conv_future.result(timeout=8.0)
+                    logger.info("Conversation context successfully retrieved")
+                    timings['conversation_context_time'] = "Completed"
+                except TimeoutError:
+                    logger.error("Conversation context building timed out")
+                    conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+                    logger.info("Fallback: Built minimal conversation context")
+                    timings['conversation_context_time'] = "TIMEOUT after 8.0 seconds"
+        except Exception as e:
+            logger.error("Error during parallel retrieval: %s", str(e))
+            document_context, context_chunks_count = "", 0
+            conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+            logger.info("Fallback: Error in context retrieval, using minimal context")
+
+        # Determine Optimal Prompt Strategy
+        if not document_context or context_chunks_count == 0:
+            logger.info("No document context found. Using conversation-focused context.")
+            timings['knowledge_source'] = "Conversation Context"
             prompt_template = "CONVERSATION_FOCUSED"
-            
-        # If we have decent document context
-        elif context_chunks_count >= 2:
-            logger.info(f"Using document-focused context with {context_chunks_count} chunks")
-            prompt_template = "DOCUMENT_FOCUSED"
-            
-        # Fallback to basic strategy
         else:
-            logger.info("Using basic context strategy (limited document context)")
-            prompt_template = "BASIC"
-        
-        # 3. BUILD THE APPROPRIATE PROMPT BASED ON STRATEGY
+            timings['knowledge_source'] = "Document Context"
+            if context_chunks_count >= 2:
+                coverage = self._compute_query_context_coverage(message_content, document_context)
+                logger.info(f"Query/context coverage: {coverage:.2f}")
+                if coverage < 0.5:
+                    logger.info("Low coverage—switching to conversation-focused to let LLM use its own knowledge")
+                    prompt_template = "CONVERSATION_FOCUSED"
+                    timings['knowledge_source'] = "Conversation Context (due to low coverage)"
+                else:
+                    logger.info(f"Using document-focused context with {context_chunks_count} chunks")
+                    prompt_template = "DOCUMENT_FOCUSED"
+            else:
+                logger.info("Using basic context strategy (limited document context)")
+                prompt_template = "BASIC"
+
         combined_prompt = self._build_optimized_prompt(
             prompt_template, 
             message_content, 
             document_context, 
             conversation_context
         )
+        logger.info(f"Combined prompt built using strategy: {prompt_template}")
         
-        # 4. SELECT APPROPRIATE LLM AND GENERATE RESPONSE WITH TIMEOUT
-        llm_client = self._select_appropriate_llm(document_context, conversation_context)
-        
+        logger.info(f"Combined prompt content (preview): {combined_prompt[:300]}")
+
+        # LLM Response Generation with Fallbacks
         llm_start = time.perf_counter()
+        
+        # Create a list of LLM clients to try in order
+        llm_clients = self._get_llm_fallback_sequence(document_context, conversation_context)
+        logger.info(f"Prepared LLM fallback sequence with {len(llm_clients)} clients")
+        
+        response_content = None
+        successful_llm = None
+        
+        for idx, llm_client in enumerate(llm_clients):
+            try:
+                logger.info(f"Attempting with LLM client {idx+1}/{len(llm_clients)}: {type(llm_client).__name__}")
+                
+                with ThreadPoolExecutor() as llm_executor:
+                    future = llm_executor.submit(
+                        llm_client.generate_response,
+                        prompt=message_content,
+                        context=combined_prompt
+                    )
+                    # Adjust timeout for fallback attempts - shorter timeouts for subsequent attempts
+                    timeout_duration = 20.0 if idx == 0 else 15.0 if idx == 1 else 10.0
+                    response_content = future.result(timeout=timeout_duration)
+                    
+                    logger.info(f"LLM {type(llm_client).__name__} response successfully generated")
+                    logger.info(f"LLM response preview: {response_content[:200]}")
+                    successful_llm = type(llm_client).__name__
+                    break  # Exit the loop if successful
+                    
+            except (TimeoutError, Exception) as e:
+                error_type = "timeout" if isinstance(e, TimeoutError) else f"error: {str(e)}"
+                logger.error(f"LLM {type(llm_client).__name__} {error_type}")
+                
+                # Only record failure for circuit breaker if this was the primary LLM
+                if idx == 0:
+                    self._record_failure()
+        
+        # If all LLMs failed, generate a failure response
+        if response_content is None:
+            logger.error("All LLM clients failed to generate a response")
+            response_content = self._generate_all_llms_failed_response(prompt_template, context_chunks_count)
+            self._record_failure()  # Record this as a critical failure
+        
+        timings['llm_response_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
+        timings['successful_llm'] = successful_llm or "None"
+        
+        return response_content
+
+    def _handle_web_search(self, message_content,conversation, timings):
+        logger.info(f"Handling web search for query: {message_content}")
+        
         try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    llm_client.generate_response,
+            #Get conversation context with better timeout handling
+            try:
+                conv_start = time.perf_counter()
+                conversation_context = self._get_cached_or_build_conversation_context(conversation, message_content)
+                timings['conversation_context_time'] = f"{time.perf_counter() - conv_start:.2f} seconds"
+            except Exception as e:
+                logger.error(f"Error building conversation context: {str(e)}")
+                conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
+                timings['conversation_context_time'] = "Error - using minimal context"
+            
+            # Execute web search
+            search_start = time.perf_counter()
+            web_search_results = web_search(message_content)
+            search_time = time.perf_counter() - search_start
+            timings['web_search_time'] = f"{search_time:.2f} seconds"
+            
+            # Extract text content from HTML for better processing
+            search_text = self._extract_text_from_html(web_search_results)
+            logger.info(f"Web search results text preview: {search_text[:150]}...")
+            
+            if search_text.strip():
+                logger.info("Web search results found")
+                
+                # Create a better structured prompt for the LLM
+                system_instruction = (
+                        "You are Presage Insights' intelligent assistant. Your task is to answer the user's query "
+                        "using the provided web search results. **Do not** emit any Markdown code fences (```), "
+                        "only raw HTML. Use `<h5>` for all section or question titles, `<p>` for paragraphs, "
+                        "and wrap your full answer in a `<div class='response-container'>`.\n\n"
+                        "1. Pull facts directly from the search-html provided.\n"
+                        "2. Cite your source inline (e.g. “(Source: BBC News)”).\n"
+                        "3. If no relevant info, state that politely and suggest alternate phrasing.\n"
+                        "4. Keep styling minimal—headings in `<h5>`, body text in `<p>`."
+                )
+                
+                user_prompt = (
+                    f"USER QUERY: {message_content}\n\n"
+                    f"WEB SEARCH RESULTS:\n{search_text}\n\n"
+                    f"CONVERSATION CONTEXT:\n{conversation_context}\n\n"
+                    "Please provide a comprehensive answer to the user's query based on the search results."
+                )
+            else:
+                logger.info("No web search results found")
+                
+                system_instruction = (
+                    "You are Presage Insights' intelligent assistant. The web search returned no results for "
+                    "the user's query. Inform the user politely while offering alternative suggestions."
+                )
+                
+                user_prompt = (
+                    f"USER QUERY: {message_content}\n\n"
+                    f"CONVERSATION CONTEXT: {conversation_context}\n\n"
+                    "No relevant web search results were found. Please inform the user and suggest alternatives."
+                )
+            
+            # Choose LLM based on query complexity, not just result length
+            # Categorize the query to determine the best model
+            query_complexity = self._assess_query_complexity(message_content)
+            
+            if query_complexity == "high" or (web_search_results and len(web_search_results) > 500):
+                llm_client = GeminiLLMClient()
+                logger.info("Using GeminiLLMClient for web_search (complex query or rich results)")
+            else:
+                llm_client = GroqLLMClient()
+                logger.info("Using GroqLLMClient for web_search (simple query)")
+            
+            # Construct messages in a consistent chat format
+            messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_prompt}
+            ]
+            
+            # Get response from LLM
+            if isinstance(llm_client, GeminiLLMClient):
+                response_content = llm_client.query_llm(
+                    messages=messages,
+                    temperature=0.5,  # Lower temperature for more factual responses
+                    max_tokens=1200    # Increased token limit for comprehensive answers
+                )
+            else:
+                # For Groq, adapt the format as needed
+                combined_prompt = f"{system_instruction}\n\n{user_prompt}"
+                response_content = llm_client.generate_response(
                     prompt=message_content,
                     context=combined_prompt
                 )
-                # Set a timeout for LLM response
-                response_content = future.result(timeout=20.0)
-        except concurrent.futures.TimeoutError:
-            logger.error("LLM response generation timed out after 20 seconds")
-            response_content = self._generate_timeout_response(prompt_template, context_chunks_count)
-        except Exception as e:
-            logger.error(f"Error generating LLM response: {str(e)}")
-            response_content = f"<div class='error-message'>I encountered an error while processing your request: {str(e)}</div>"
-        
-        timings['llm_response_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
-        
-        return response_content
-
-    # Add this helper method
-    def _build_short_context(self, conversation, max_recent=3):
-        """Build a shorter context for large documents"""
-        messages = list(
-            Message.objects.filter(conversation=conversation).order_by('-created_at')[:max_recent]
-        )
-        messages = sorted(messages, key=lambda x: x.created_at)
-        context_lines = []
-        for msg in messages:
-            prefix = "User:" if msg.is_user else "Assistant:"
-            # Truncate long messages
-            content = msg.content
-            if len(content) > 200:
-                content = content[:200] + "..."
-            context_lines.append(f"{prefix} {content}")
-        return "\n".join(context_lines)
-
-    def _handle_fetch_data(self, asset_id, message_content, timings):
-        logger.info(f"Handling fetch data request for asset_id: {asset_id}")
-        
-        api_start = time.perf_counter()
-        try:
-            api_url = f"/api/asset-data/{asset_id}/"
-            response = requests.get(api_url)
             
-            if response.status_code == 200:
-                asset_data = response.json()
-                logger.info(f"Successfully fetched data for asset: {asset_id}")
-                
-                analysis_data = {
-                    "asset_type": asset_data.get("asset_type", "Unknown"),
-                    "running_RPM": asset_data.get("running_RPM", 0),
-                    "bearing_fault_frequencies": asset_data.get("bearing_fault_frequencies", {}),
-                    "acceleration_time_waveform": asset_data.get("acceleration_time_waveform", {}),
-                    "velocity_time_waveform": asset_data.get("velocity_time_waveform", {}),
-                    "harmonics": asset_data.get("harmonics", {}),
-                    "cross_PSD": asset_data.get("cross_PSD", {})
-                }
-                
-                serializer = VibrationAnalysisInputSerializer(data=analysis_data)
-                if serializer.is_valid():
-                    analysis_result = self._perform_vibration_analysis(serializer.validated_data)
-                    
-                    analysis_str = json.dumps(analysis_result)
-                    # Choose LLM client based on complexity of analysis_result
-                    if len(analysis_str.split()) > 300:
-                        llm_client = GeminiLLMClient()
-                        logger.info("Using GeminiLLMClient for fetch_data (complex analysis).")
-                    else:
-                        llm_client = GroqLLMClient()
-                        logger.info("Using GroqLLMClient for fetch_data.")
-
-                    formatting_prompt = f"""
-                    Format the following vibration analysis results into a user-friendly HTML response.
-                    Organize with headings, bullet points, and highlight important findings.
-                    Include the asset ID: {asset_id} in your response.
-                    
-                    Analysis data: {json.dumps(analysis_result)}
-                    
-                    User query: {message_content}
-                    """
-                    formatted_response = llm_client.generate_response(prompt=formatting_prompt, context="")
-                    timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
-                    return formatted_response
-                else:
-                    error_msg = f"Invalid data format for vibration analysis: {serializer.errors}"
-                    logger.error(error_msg)
-                    return f"<div class='error-message'>Unable to analyze data for asset {asset_id}. The data format is invalid.</div>"
-            else:
-                error_msg = f"Failed to fetch data for asset {asset_id}. Status code: {response.status_code}"
-                logger.error(error_msg)
-                return f"<div class='error-message'>Unable to fetch data for asset {asset_id}. Please check if the asset ID is correct.</div>"
-                
-        except Exception as e:
-            error_msg = f"Error fetching or analyzing data for asset {asset_id}: {str(e)}"
-            logger.error(error_msg)
-            timings['api_fetch_and_analysis_time'] = f"{time.perf_counter() - api_start:.2f} seconds"
-            return f"<div class='error-message'>An error occurred while processing data for asset {asset_id}: {str(e)}</div>"
-
-    def _perform_vibration_analysis(self, data):
-        prompt = f"""
-You are a level 3 vibration analyst.
-Perform a comprehensive analysis of the asset's condition using the provided data.
-Return your analysis as a structured JSON object with the following keys:
-- "overview": A brief summary of the asset's condition.
-- "time_domain_analysis": Detailed analysis of the acceleration and velocity time waveforms.
-- "frequency_domain_analysis": Analysis of the harmonics and cross PSD data.
-- "bearing_faults": Analysis of the bearing fault frequencies.
-- "recommendations": A list of actionable maintenance recommendations.
-
-Data:
-{{
-  "asset_type": "{data['asset_type']}",
-  "running_RPM": {data['running_RPM']},
-  "bearing_fault_frequencies": {data['bearing_fault_frequencies']},
-  "acceleration_time_waveform": {data['acceleration_time_waveform']},
-  "velocity_time_waveform": {data['velocity_time_waveform']},
-  "harmonics": {data['harmonics']},
-  "cross_PSD": {data['cross_PSD']}
-}}
-
-Instructions:
-- Provide a concise overview.
-- Include detailed analysis for time and frequency domains.
-- Mention any bearing faults if present.
-- List clear maintenance recommendations.
-- Return only valid JSON.
-"""
-        mistral_client = MistralLLMClient()
-        response_text = mistral_client.query_llm([
-            {"role": "user", "content": prompt}
-        ])
-
-        try:
-            analysis_data = json.loads(response_text)
-            return analysis_data
-        except Exception as e:
-            logger.error(f"Failed to parse vibration analysis response: {str(e)}")
-            return {
-                "error": "Failed to parse analysis results",
-                "raw_response": response_text
-            }
-
-    def _handle_web_search(self, message_content, timings):
-        logger.info(f"Handling web search for query: {message_content}")
-        
-        search_start = time.perf_counter()
-        web_search_results = web_search(message_content)
-        
-        if web_search_results:
-            logger.info("Web search results found")
-            combined_prompt = (
-                f"Web Search Results:\n{web_search_results}\n\n"
-                f"User Query:\n{message_content}\n\n"
-                f"Please provide a comprehensive response to the user's query using the above web search results."
-            )
-        else:
-            logger.info("No web search results found")
-            combined_prompt = (
-                f"User Query:\n{message_content}\n\n"
-                f"No relevant web search results were found. Provide the best response based on your knowledge."
-            )
-        
-        # Use Gemini if web search results are long, otherwise Groq
-        if web_search_results and len(web_search_results.split()) > 100:
-            llm_client = GeminiLLMClient()
-            logger.info("Using GeminiLLMClient for web_search (rich search results).")
-        else:
-            llm_client = GroqLLMClient()
-            logger.info("Using GroqLLMClient for web_search.")
+            # Ensure proper HTML formatting
+            if not response_content.strip().startswith('<div class="response-container"'):
+                response_content = f'<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">{response_content}</div>'
             
-        response_content = llm_client.generate_response(
-            prompt=message_content,
-            context=combined_prompt
-        )
-        
-        timings['web_search_time'] = f"{time.perf_counter() - search_start:.2f} seconds"
-        return response_content
+            return response_content
+            
+        except Exception as e:
+            logger.error(f"Error in web search handling: {str(e)}")
+            error_response = (
+                '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p>I apologize, but I encountered an error while searching for information on your query. '
+                'Please try rephrasing your question or asking something else.</p>'
+                '</div>'
+            )
+            return error_response
 
     def _get_or_create_conversation(self, conversation_id, asset_id):
         # Use cache to avoid repeated DB queries
@@ -594,6 +613,7 @@ Instructions:
         
         # If we have at least some results, return them even if less than requested
         if context_chunks:
+            logger.info(f"Context chunks: {context_chunks}")
             logger.info(f"Retrieved total of {len(context_chunks)} context chunks via vector search")
             # Cache results with a TTL based on result count (more results = longer cache)
             cache_ttl = min(300 + (len(context_chunks) * 60), 1800)  # Between 5-30 minutes
@@ -683,28 +703,6 @@ Instructions:
             prefix = "User:" if msg.is_user else "Assistant:"
             context_lines.append(f"{prefix} {msg.content}")
         return "\n".join(context_lines)
-
-    def _summarize_conversation_context(self, conversation, llm_client, word_threshold=300):
-        mistral_client = MistralLLMClient()
-        summary = conversation.summary or ""
-        if len(summary.split()) > word_threshold:
-            prompt = (
-                "Please summarize the following conversation history into a concise summary (2-3 lines):\n\n"
-                f"{summary}"
-            )
-            new_summary = mistral_client.generate_response(prompt=prompt, context="")
-            conversation.summary = new_summary
-            conversation.save()
-            return new_summary
-        return summary
-
-    def _build_context_prompt(self, conversation, llm_client, max_recent=10, word_threshold=300):
-        summarized_context = self._summarize_conversation_context(conversation, llm_client, word_threshold)
-        recent_context = self._build_conversation_context(conversation, max_recent)
-        if summarized_context:
-            return f"Conversation Summary:\n{summarized_context}\n\nRecent Conversation:\n{recent_context}"
-        else:
-            return recent_context
         
     def _build_minimal_context_prompt(self, conversation, max_recent=5):
         # Only retrieve the most recent messages with limited fields
@@ -741,34 +739,95 @@ Instructions:
             logger.info(f"Using GroqLLMClient (context size: {total_chars} chars)")
             return GroqLLMClient()
         
-    def _retrieve_document_context(self, query, asset_id):
-        """Retrieves document context with timing and returns both the context and chunk count"""
+    def _retrieve_document_context(self, query, asset_id, max_tokens=2500):
+        """Retrieves high-quality document context with adaptive retrieval strategies"""
         context_start = time.perf_counter()
         context_chunks = []
         
         try:
             if pinecone_client is not None:
-                # Use optimized context retrieval method
-                top_k = 5  # Start with reasonable default
-                context_chunks = self._retrieve_context_chunks(query, asset_id, top_k)
+                # Step 1: Generate a better search query by extracting key terms
+                enriched_query = self._enhance_search_query(query)
+                logger.info(f"Enhanced query: {enriched_query}")
                 
-                # If we got less than 2 chunks, try with a lower similarity threshold
+                # Step 2: First attempt with stricter relevance threshold
+                top_k = 3  # Start with fewer chunks but higher quality
+                context_chunks = self._retrieve_context_chunks(
+                    enriched_query, asset_id, top_k, similarity_threshold=0.75
+                )
+                
+                # Step 3: Adaptive retrieval based on initial results
                 if len(context_chunks) < 2:
                     logger.info("First retrieval got insufficient chunks, trying with lower threshold")
+                    # Try with lower threshold but still limit results
                     context_chunks = self._retrieve_context_chunks(
-                        query, asset_id, top_k, similarity_threshold=0.6
+                        enriched_query, asset_id, 4, similarity_threshold=0.65
                     )
+                    
+                    # If still insufficient, try with original query as fallback
+                    if len(context_chunks) < 2:
+                        logger.info("Second retrieval still insufficient, using original query")
+                        context_chunks = self._retrieve_context_chunks(
+                            query, asset_id, 5, similarity_threshold=0.6
+                        )
             else:
                 logger.error("PineconeClient initialization failed")
         except Exception as e:
             logger.error(f"Error during context retrieval: {str(e)}")
+            # Return empty to avoid further errors
+            return "", 0
         
-        document_context = self._format_context(context_chunks)
+        # Format context based on the type of chunks we have
+        document_context = self._format_context_safe(context_chunks)
+        logger.info(f"Formatted document context: {document_context[:100]}...")  # Log only first 100 chars
         
-        # Add runtime as property
+        # Log metrics
         running_time = time.perf_counter() - context_start
+        logger.info(f"Retrieved {len(context_chunks)} chunks in {running_time:.2f}s")
         
         return document_context, len(context_chunks)
+
+    def _format_context_safe(self, chunks):
+        """Format chunks safely handling both object and dictionary types"""
+        if not chunks:
+            return ""
+        
+        formatted_sections = []
+        
+        for i, chunk in enumerate(chunks):
+            # Handle both object and dictionary types
+            if isinstance(chunk, dict):
+                # For dictionary chunks
+                content = chunk.get('text', '')  # Changed from 'content' to 'text' to match actual data structure
+                section_name = chunk.get('section_name', f"Section {i+1}")
+                score = chunk.get('score', None)
+            else:
+                # For object chunks
+                content = getattr(chunk, 'text', '') if hasattr(chunk, 'text') else getattr(chunk, 'content', '')
+                section_name = getattr(chunk, 'section_name', f"Section {i+1}")
+                score = getattr(chunk, 'score', None)
+            
+            # Add section header with relevance indicator
+            relevance_str = f" (Relevance: {score:.2f})" if score is not None else ""
+            section_header = f"[{section_name}{relevance_str}]"
+            
+            # Make sure to include the actual content, not placeholder
+            formatted_sections.append(f"{section_header}\n{content}")
+        
+        return "\n\n".join(formatted_sections)
+
+    def _enhance_search_query(self, query):
+        """Extract key terms to create a more focused search query"""
+        # Simple implementation - extract nouns and technical terms
+        words = query.split()
+        if len(words) > 8:
+            # For longer queries, extract key terms
+            import re
+            # Keep technical terms, function names, and important nouns
+            tech_pattern = r'\b[a-zA-Z_]+\(.*?\)|\b[a-zA-Z_]+\b|[a-zA-Z_]+_[a-zA-Z_]+'
+            tech_terms = re.findall(tech_pattern, query)
+            return " ".join(tech_terms if tech_terms else words[:8])
+        return query
 
     def _get_cached_or_build_conversation_context(self, conversation, current_query):
         """Gets conversation context from cache or builds it if not available"""
@@ -782,9 +841,29 @@ Instructions:
         message_count = Message.objects.filter(conversation=conversation).count()
         
         if message_count > 15:
-            # For longer conversations, use summarization
+            # For longer conversations, use summarization with limit of 5 summaries
             mistral_client = MistralLLMClient()
-            context = self._build_context_prompt(conversation, mistral_client)
+            
+            # Get the conversation summary and split into individual summaries
+            summary = conversation.summary or ""
+            summaries = summary.split("\n")
+            
+            # Keep only the last 5 summaries if there are more
+            if len(summaries) > 5:
+                limited_summaries = summaries[-5:]  # Take the 5 most recent summaries
+                limited_summary = "\n".join(limited_summaries)
+            else:
+                limited_summary = summary
+                
+            # Get recent conversation as before
+            recent_context = self._build_conversation_context(conversation, max_recent=10)
+            
+            # Combine the limited summary with recent context
+            if limited_summary:
+                context = f"Conversation Summary:\n{limited_summary}\n\nRecent Conversation:\n{recent_context}"
+            else:
+                context = recent_context
+                
         elif message_count > 5:
             # For medium conversations, use simplified context
             context = self._build_minimal_context_prompt(conversation)
@@ -799,236 +878,129 @@ Instructions:
         return context
 
     def _build_optimized_prompt(self, template, query, document_context, conversation_context):
-        """Builds optimized prompt based on template and available context"""
+        """Builds an optimized prompt based on template and available context with enhanced instructions
+        to cover all parts of the query, using LLM expertise where context is missing."""
+        
+        # First, verify we actually have context to use
+        if not document_context or document_context.strip() == "":
+            logger.warning("Document context is empty or contains only section headers")
+            document_context = "No relevant document context available."
         
         if template == "DOCUMENT_FOCUSED":
-            # When we have good document context, focus primarily on it
+            # When we have rich document context, focus on it but also fill in missing details.
             return (
                 f"Relevant Document Information:\n{document_context}\n\n"
                 f"Previous Messages:\n{conversation_context}\n\n"
                 f"Current User Query: {query}\n\n"
-                "Instructions: Focus primarily on the document information to answer the query."
+                "Instructions: Provide a comprehensive answer that addresses every aspect of the user's question. "
+                "Focus primarily on the document information; however, if some parts of the query are not directly covered in the document, "
+                "use your expertise and logical reasoning to generate a complete answer. Do not simply state that information is missing—instead, infer "
+                "or approximate the details (such as ratings or evaluations) based on context and best practices."
             )
         
         elif template == "CONVERSATION_FOCUSED":
-            # When document context is missing but conversation context is available
+            # When document context is missing but conversation context is available, rely on it and add expert reasoning.
             return (
-                f"Conversation History:\n{conversation_context}\n\n"
-                f"Current User Query: {query}\n\n"
-                "Instructions: Based on the conversation history, provide a helpful response."
+                "You are Presage Insights AI Assistant, a helpful AI assistant for answering questions.\n\n"
+                "IMPORTANT INSTRUCTIONS:\n"
+                "1. The user’s question isn’t covered by any document context.\n"
+                "2. If you know the answer from your general knowledge, provide a helpful, accurate response.\n"
+                "3. If you’re uncertain or don’t know, be honest about your limitations.\n"
+                "4. Keep your response focused on the user’s question.\n"
+                "5. Format your response in HTML using <div>, <p>, <ul>, <li>, <strong>, <em>, etc.\n\n"
+                f"User question: {query}\n\n"
+                f"Conversation context:\n{conversation_context}\n\n"
+                "Please provide a helpful response using your general knowledge:"
             )
         
         else:  # BASIC
-            # Balanced approach for cases with limited context
+            # A balanced approach when context is limited.
             return (
                 f"Document Information (if available):\n{document_context}\n\n"
                 f"Conversation Context:\n{conversation_context}\n\n"
                 f"Current User Query: {query}\n\n"
-                "Instructions: Provide a concise and helpful response based on available information."
-            )
-
-    def _generate_timeout_response(self, template_type, context_chunk_count):
-        """Generate appropriate timeout response based on context"""
-        
-        if template_type == "DOCUMENT_FOCUSED" and context_chunk_count > 3:
-            return (
-                "<div class='timeout-message'>"
-                "<p>I found relevant information in your documents, but I'm having trouble processing "
-                "the complete response right now. Here are some suggestions:</p>"
-                "<ul>"
-                "<li>Try asking a more specific question about a particular aspect</li>"
-                "<li>Break your query into smaller parts</li>"
-                "<li>Try again in a moment when the system is less busy</li>"
-                "</ul>"
-                "</div>"
-            )
-        else:
-            return (
-                "<div class='timeout-message'>"
-                "<p>I apologize, but I'm having trouble processing your request at the moment. "
-                "This could be due to high system load or the complexity of your query.</p>"
-                "<p>Please try again with a more specific question or try again shortly.</p>"
-                "</div>"
+                "Instructions: Provide a concise yet comprehensive answer that addresses all parts of the query. "
+                "Use the available document and conversation context as a base. Where information is missing, rely on your expertise to infer and generate "
+                "the necessary details. Ensure that the final answer is complete and does not simply mention that certain details are not available."
             )
         
-    def _handle_conversation_recall(self, message_content, asset_id, conversation, timings):
+    def _compute_query_context_coverage(self, query: str, context: str) -> float:
         """
-        Handle queries by focusing exclusively on conversation history for the asset.
-        This is optimized for recalling personal information shared by users.
+        Returns the fraction of unique words in `query` that also appear in `context`.
+        A low ratio means most of the query isn't represented in the context.
         """
-        logger.info(f"Handling conversation recall for asset_id: {asset_id}")
-        
-        # Start timing
-        recall_start = time.perf_counter()
-        
-        # 1. First gather current conversation messages
-        current_messages = list(
-            Message.objects.filter(conversation=conversation).order_by('created_at')
-        )
-        
-        # 2. Build the current conversation context with higher message limit
-        current_conversation_context = ""
-        if current_messages:
-            current_conversation_context = self._build_conversation_context(conversation, max_recent=30)
-        
-        # 3. Also find other conversations for this asset to get more context
-        # But only if we need more information
-        all_contexts = [current_conversation_context] if current_conversation_context else []
-        
-        if len(current_messages) < 5:  # Only search other conversations if current one is short
-            logger.info("Current conversation is short, looking for other conversations for this asset")
-            other_conversations = Conversation.objects.filter(
-                asset_id=asset_id
-            ).exclude(
-                id=conversation.id
-            ).order_by('-updated_at')[:3]
-            
-            for other_conv in other_conversations:
-                other_context = self._build_conversation_context(other_conv, max_recent=15)
-                if other_context:
-                    all_contexts.append(f"Previous conversation:\n{other_context}")
-        
-        full_conversation_context = "\n\n".join([ctx for ctx in all_contexts if ctx])
-        
-        # If we have no context at all, handle gracefully
-        if not full_conversation_context:
-            logger.warning("No conversation context found for conversation recall")
-            return (
-                "<div class='response-container'>"
-                "<p>I don't seem to have any previous conversation information about that. "
-                "Could you please provide more details?</p>"
-                "</div>"
-            )
-        
-        # 4. Extract relevant information from the user query to better focus recall
-        query_keywords = self._extract_query_keywords(message_content)
-        logger.info(f"Extracted keywords for conversation recall: {query_keywords}")
-        
-        # 5. Create an optimized prompt specifically for conversation recall with query focus
-        prompt = f"""
-    You are an assistant that recalls information from conversation history.
-    Your ONLY task is to answer based on the conversation history provided below.
+        # very simple tokenization
+        query_tokens = set(re.findall(r"\w+", query.lower()))
+        if not query_tokens:
+            return 0.0
+        context_lc = context.lower()
+        present = sum(1 for tok in query_tokens if tok in context_lc)
+        return present / len(query_tokens)
 
-    Conversation History:
-    {full_conversation_context}
-
-    Current User Query:
-    {message_content}
-
-    Query Focus Keywords:
-    {', '.join(query_keywords)}
-
-    IMPORTANT INSTRUCTIONS:
-    1. Answer EXCLUSIVELY based on information found in the conversation history above.
-    2. DO NOT use any external knowledge, web information, or made-up details.
-    3. If the conversation history contains the information requested, provide it clearly and concisely.
-    4. If the information is NOT in the conversation history, explicitly state: "I don't have that information in our conversation history."
-    5. Focus especially on personal details the user has shared about themselves or others in the conversation.
-    6. Present your response in a natural, conversational manner.
-    7. Don't mention that you're using "conversation recall" or explain your methodology.
-    """
-
-        # 6. Select appropriate LLM - use MistralLLM for conversation recall
-        llm_client = MistralLLMClient()
-        
-        # 7. Generate response with timeout protection
-        llm_start = time.perf_counter()
-        try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    llm_client.generate_response,
-                    prompt=message_content,
-                    context=prompt
-                )
-                # Set a timeout for LLM response
-                response_content = future.result(timeout=15.0)
-        except concurrent.futures.TimeoutError:
-            logger.error("LLM response generation for conversation recall timed out after 15 seconds")
-            response_content = (
-                "<div class='response-container'>"
-                "<p>I'm having trouble recalling details from our conversation right now. "
-                "Could you please repeat your question or provide more specifics?</p>"
-                "</div>"
-            )
-        except Exception as e:
-            logger.error(f"Error generating LLM response for conversation recall: {str(e)}")
-            response_content = (
-                "<div class='response-container'>"
-                f"<p>I encountered an error while trying to recall our conversation. Please try again with a more specific question.</p>"
-                "</div>"
-            )
-        
-        timings['llm_conversation_recall_time'] = f"{time.perf_counter() - llm_start:.2f} seconds"
-        timings['total_conversation_recall_time'] = f"{time.perf_counter() - recall_start:.2f} seconds"
-        
-        return response_content
     
-    def _extract_user_information(self, conversation_context):
-        """Extract key user information from conversation history to aid in recall"""
-        mistral_client = MistralLLMClient()
+    def _get_llm_fallback_sequence(self, document_context, conversation_context):
+        """Return an ordered list of LLM clients to try in sequence."""
+        # Get the primary LLM based on context size
+        primary_llm = self._select_appropriate_llm(document_context, conversation_context)
         
-        extraction_prompt = f"""
-        Extract key personal information the user has shared about themselves from this conversation.
-        Focus on details like their name, role, preferences, background, etc.
-        Format as JSON with appropriate keys.
-        Only include information explicitly mentioned by the user.
+        # Create a list of all available LLM clients
+        all_llms = [GeminiLLMClient(), MistralLLMClient(), GroqLLMClient()]
         
-        Conversation:
-        {conversation_context}
-        """
+        # Remove the primary LLM from the list if it's already there
+        fallback_llms = [llm for llm in all_llms if not isinstance(llm, type(primary_llm))]
         
-        try:
-            info_json_str = mistral_client.generate_response(prompt=extraction_prompt, context="")
-            user_info = json.loads(info_json_str)
-            return user_info
-        except:
-            # Fallback to simpler extraction if JSON parsing fails
-            logger.warning("JSON parsing of user information failed, using simpler extraction")
-            return {"raw_extraction": info_json_str}
+        # Return a sequence with primary LLM first, followed by fallbacks
+        return [primary_llm] + fallback_llms
+
+    def _generate_all_llms_failed_response(self, prompt_template, context_chunks_count):
+        """Generate a graceful response when all LLM attempts have failed."""
+        return (
+            "<div class='system-message'>"
+            "<p>I'm currently experiencing technical difficulties processing your question. "
+            "Our systems are working at reduced capacity at the moment.</p>"
+            "<p>Please try:</p>"
+            "<ul>"
+            "<li>Asking a shorter or simpler question</li>"
+            "<li>Trying again in a few minutes</li>"
+            "<li>Breaking your question into smaller parts</li>"
+            "</ul>"
+            "</div>"
+        )
+    
+    def _extract_text_from_html(self, html_content):
+        """Extract plain text from HTML search results for better LLM processing"""
+        if not html_content:
+            return ""
         
-    def _extract_query_keywords(self, query):
-        """Extract key focus words from user query to improve recall precision"""
-        # Remove common stopwords
-        stopwords = {"the", "a", "an", "is", "are", "was", "were", "be", "been", 
-                    "being", "to", "of", "and", "or", "not", "no", "in", "on", 
-                    "at", "by", "for", "with", "about", "against", "between", 
-                    "into", "through", "during", "before", "after", "above", 
-                    "below", "from", "up", "down", "out", "off", "over", "under", 
-                    "again", "further", "then", "once", "here", "there", "when", 
-                    "where", "why", "how", "all", "any", "both", "each", "few", 
-                    "more", "most", "other", "some", "such", "than", "too", "very", 
-                    "can", "will", "just", "should", "now"}
+        # Simple regex-based extraction (you could use BeautifulSoup for more robust parsing)
+        # Remove HTML tags but preserve important text
+        text = re.sub(r'<[^>]*>', ' ', html_content)
+        # Clean up whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
         
-        # Extract potentially important terms
-        words = query.lower().split()
-        keywords = []
-        
-        # Special handling for "tell me about X" pattern
-        tell_about_match = re.search(r"tell (?:me|us) about ([^?.,!]+)", query.lower())
-        if tell_about_match:
-            subject = tell_about_match.group(1).strip()
-            keywords.append(subject)
-        
-        # Add named entities and non-stopwords
-        for word in words:
-            # Clean the word
-            word = word.strip(".,!?:;\"'()[]{}").lower()
+        return text
+
+    def _assess_query_complexity(self, query):
+        """Assess query complexity to determine the best LLM to use"""
+        # Check for indicators of complex queries
+        complex_indicators = [
+            # Multiple questions or multi-part query
+            '?' in query and query.count('?') > 1,
             
-            # Keep terms that might be names or important identifiers
-            if (word not in stopwords and len(word) > 2) or word[0].isupper():
-                keywords.append(word)
+            # Long query (more than 15 words)
+            len(query.split()) > 15,
+            
+            # Specific technical terms
+            any(term in query.lower() for term in [
+                'compare', 'contrast', 'analyze', 'explain', 'technical', 
+                'detailed', 'comprehensive', 'in-depth'
+            ]),
+            
+            # Requires synthesis of multiple concepts
+            ';' in query or ' and ' in query or ' versus ' in query or ' vs ' in query
+        ]
         
-        # Always look for personal references
-        personal_terms = ["i", "me", "my", "mine", "myself", "name", "job", "role", 
-                        "company", "work", "position", "background"]
-        
-        for term in personal_terms:
-            if term in query.lower() and term not in keywords:
-                keywords.append(term)
-        
-        # Return unique keywords, maintaining original order
-        seen = set()
-        return [x for x in keywords if not (x in seen or seen.add(x))]
+        return "high" if any(complex_indicators) else "normal"
     
     @action(detail=False, methods=['get'])
     def history(self, request):
@@ -1036,100 +1008,180 @@ Instructions:
         asset_id = request.query_params.get('asset_id')
         cache_timeout = 60
         
-        if conversation_id:
-            cache_key = f"chat_history_conversation_{conversation_id}"
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                return Response(cached_data)
-            
-            conversation = get_object_or_404(Conversation, id=conversation_id)
-            messages = Message.objects.filter(conversation=conversation).order_by('created_at')
-            message_pairs = []
+        # Create a message pairs utility function to avoid duplication
+        def create_message_pairs(messages, conversation):
+            pairs = []
             user_message = None
-
-            for message in messages:
-                if message.is_user:
+            
+            for msg in messages:
+                if msg.is_user:
                     if user_message:
-                        message_pairs.append({
+                        pairs.append({
                             'conversation': conversation,
                             'user_message': user_message,
-                            'system_message': None
+                            'system_message': None,
                         })
-                    user_message = message
+                    user_message = msg
                 else:
                     if user_message:
-                        message_pairs.append({
+                        pairs.append({
                             'conversation': conversation,
                             'user_message': user_message,
-                            'system_message': message
+                            'system_message': msg,
                         })
                         user_message = None
                     else:
-                        message_pairs.append({
+                        pairs.append({
                             'conversation': conversation,
                             'user_message': None,
-                            'system_message': message
+                            'system_message': msg,
                         })
+            
             if user_message:
-                message_pairs.append({
+                pairs.append({
                     'conversation': conversation,
                     'user_message': user_message,
-                    'system_message': None
+                    'system_message': None,
                 })
+                
+            return pairs
 
-            serializer = MessagePairSerializer(message_pairs, many=True)
-            response_data = serializer.data
-            cache.set(cache_key, response_data, timeout=cache_timeout)
-            return Response(response_data)
+        # only fetch the fields we actually use
+        message_qs = Message.objects.only('id', 'is_user', 'content', 'created_at', 'processing_status')
+
+        if conversation_id:
+            cache_key = f"chat_history_conversation_{conversation_id}"
+            
+            # Check if there are any processing messages
+            has_processing = message_qs.filter(
+                conversation__id=conversation_id, 
+                is_user=False, 
+                processing_status__in=["pending", "processing"]
+            ).exists()
+            
+            # If there are processing messages, don't use cache
+            if has_processing:
+                cached = None
+            else:
+                # Try to get from cache first
+                cached = cache.get(cache_key)
+                
+                # Check if we should invalidate cache - get latest message timestamp
+                if cached:
+                    conversation = get_object_or_404(Conversation, id=conversation_id)
+                    latest_message = message_qs.filter(conversation=conversation).order_by('-created_at').first()
+                    
+                    # If there's no latest message in the DB or cached data is empty, invalidate
+                    if not latest_message or not cached:
+                        cached = None
+                    else:
+                        # Check if our cached data includes all messages by comparing counts
+                        msg_count = message_qs.filter(conversation=conversation).count()
+                        
+                        # Calculate message count in cached data
+                        cached_msg_count = sum(1 for pair in cached if pair.get('user_message')) + \
+                                        sum(1 for pair in cached if pair.get('system_message'))
+                        
+                        if cached_msg_count != msg_count:
+                            cached = None
+
+            if not cached:
+                conversation = get_object_or_404(Conversation, id=conversation_id)
+                messages = message_qs.filter(conversation=conversation).order_by('created_at')
+                
+                message_pairs = create_message_pairs(messages, conversation)
+                
+                serializer = MessagePairSerializer(message_pairs, many=True)
+                data = serializer.data
+                
+                # Only cache if there are no processing messages
+                if not has_processing:
+                    cache.set(cache_key, data, timeout=cache_timeout)
+                    
+                return Response(data)
+            
+            return Response(cached)
 
         elif asset_id:
             cache_key = f"chat_history_asset_{asset_id}"
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                return Response(cached_data)
             
-            conversations = Conversation.objects.filter(asset_id=asset_id).order_by('-updated_at')
-            all_message_pairs = []
-            for conversation in conversations:
-                messages = Message.objects.filter(conversation=conversation).order_by('created_at')
-                user_message = None
-                for message in messages:
-                    if message.is_user:
-                        if user_message:
-                            all_message_pairs.append({
-                                'conversation': conversation,
-                                'user_message': user_message,
-                                'system_message': None
-                            })
-                        user_message = message
+            # Check if there are any processing messages for this asset
+            has_processing = message_qs.filter(
+                conversation__asset_id=asset_id, 
+                is_user=False, 
+                processing_status__in=["pending", "processing"]
+            ).exists()
+            
+            # If there are processing messages, don't use cache
+            if has_processing:
+                cached = None
+            else:
+                # Try to get from cache first
+                cached = cache.get(cache_key)
+                
+                # Check if we should invalidate cache
+                if cached:
+                    # Get all conversations for this asset
+                    conversations = Conversation.objects.filter(asset_id=asset_id)
+                    
+                    if not conversations.exists() or not cached:
+                        cached = None
                     else:
-                        if user_message:
-                            all_message_pairs.append({
-                                'conversation': conversation,
-                                'user_message': user_message,
-                                'system_message': message
-                            })
-                            user_message = None
-                        else:
-                            all_message_pairs.append({
-                                'conversation': conversation,
-                                'user_message': None,
-                                'system_message': message
-                            })
-                if user_message:
-                    all_message_pairs.append({
-                        'conversation': conversation,
-                        'user_message': user_message,
-                        'system_message': None
-                    })
+                        # Get the latest update time across all conversations
+                        latest_update = conversations.aggregate(Max('updated_at'))['updated_at__max']
+                        
+                        # Check if we have new conversations or messages since the cache was created
+                        cache_created_time = cache.get(f"{cache_key}_created_at")
+                        
+                        if not cache_created_time or latest_update and latest_update > cache_created_time:
+                            cached = None
             
-            serializer = MessagePairSerializer(all_message_pairs, many=True)
-            response_data = serializer.data
-            cache.set(cache_key, response_data, timeout=cache_timeout)
-            return Response(response_data)
-
+            if not cached:
+                conversations = (
+                    Conversation.objects
+                    .filter(asset_id=asset_id)
+                    .order_by('-updated_at')
+                    .prefetch_related(
+                        Prefetch(
+                            'messages',
+                            queryset=message_qs.order_by('created_at'),
+                            to_attr='ordered_messages'
+                        )
+                    )
+                )
+                
+                all_message_pairs = []
+                for conv in conversations:
+                    conv_pairs = create_message_pairs(conv.ordered_messages, conv)
+                    all_message_pairs.extend(conv_pairs)
+                
+                serializer = MessagePairSerializer(all_message_pairs, many=True)
+                data = serializer.data
+                
+                # Only cache if there are no processing messages
+                if not has_processing:
+                    # Store cache with creation timestamp
+                    now = timezone.now()
+                    cache.set(cache_key, data, timeout=cache_timeout)
+                    cache.set(f"{cache_key}_created_at", now, timeout=cache_timeout)
+                    
+                return Response(data)
+            
+            return Response(cached)
+        
         else:
             return Response(
                 {"error": "Please provide either conversation_id or asset_id as query parameters."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    def _invalidate_conversation_cache(self, conversation_id):
+        """Invalidate the cache for a specific conversation"""
+        cache_key = f"chat_history_conversation_{conversation_id}"
+        cache.delete(cache_key)
+    
+    def _invalidate_asset_cache(self, asset_id):
+        """Invalidate the cache for an asset"""
+        cache_key = f"chat_history_asset_{asset_id}"
+        cache.delete(cache_key)
+        cache.delete(f"{cache_key}_created_at")

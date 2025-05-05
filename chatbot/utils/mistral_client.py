@@ -170,26 +170,31 @@ class MistralLLMClient:
                 "<h6>Conclusion</h6><ul><li>Summary points</li></ul>"
             )
 
-    def _get_full_response(self, prompt, outline, context=None, max_length=800):
-        domain_expert_instructions = (
-            "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
-            "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
-        )
+    def _get_full_response(self, prompt, context=None, max_length=800):
+        if "Web Search Results:" in context:
+            # For web search queries
+            domain_expert_instructions = (
+                "You are Presage Insights' AI assistant. When web search results are provided, use them to answer the user's question. "
+                "Synthesize information from the search results to give accurate, helpful responses. "
+                "Be direct and comprehensive. Format your response with appropriate HTML for readability. "
+                "If the search results don't contain enough information to answer the question fully, state what you can determine "
+                "from the results and acknowledge any limitations."
+            )
+        else:
+            # For document queries (original behavior)
+            domain_expert_instructions = (
+                "You are a document retrieval assistant. Your primary task is to answer user questions based on the supplied document whenever possible. "
+                "First, carefully check if the document contains information relevant to the question. "
+                "If the document contains relevant information, use only that information to construct your answer. "
+                "If the document does not contain relevant information, or if the information is insufficient, you may use your own general knowledge to provide the best possible answer."
+            )
 
         system_content = (
-            "You are a precise, professional technical support assistant. "
-            f"Follow this outline for your response structure:\n\n{outline}\n\n"
-            "CRITICAL FORMATTING REQUIREMENTS:\n"
-            "1. Format your ENTIRE response as clean HTML with NO markdown.\n"
-            "2. Start with <div class='response-container'> and end with </div>.\n"
-            "3. Use appropriate HTML tags: <p> for paragraphs, <h6> for headings, and <strong> for emphasis.\n"
-            "4. Use proper HTML lists: <ul><li> for bullet points and <ol><li> for numbered lists.\n"
-            "5. For nested lists, place the entire list inside the parent <li> element.\n"
-            "6. Ensure all tags are closed and no sentence is left incomplete.\n"
-            "7. End with a proper conclusion paragraph.\n"
-            "8. Maintain a clear logical structure with a beginning, middle, and end.\n"
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response. "
+            "Ensure the entire output starts with '<div class=\"response-container\">' and ends with '</div>', uses proper HTML tags (<p>, <h6>, <strong>) and lists (<ul>/<ol>), "
+            "and is entirely valid with all tags closed. The response must be concise with a clear introduction, body, and conclusion, "
+            "and integrate the following domain expertise:\n\n" + domain_expert_instructions
         )
-        system_content += domain_expert_instructions
         if context:
             system_content += f"\n\nRelevant Context: {context}\n\nUse this context to inform your response."
 
@@ -211,7 +216,6 @@ class MistralLLMClient:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logger.info("Generating full response with outline guidance...")
         response = requests.post(
             self.base_url,
             json=payload,
@@ -226,6 +230,7 @@ class MistralLLMClient:
 
     def generate_response(self, prompt, context=None, max_length=800):
         overall_start = time.perf_counter()
+        logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context)} chars")
 
         # Check for basic greetings and return a hardcoded response if applicable.
         basic_greetings = {"hi", "hii", "hello", "hey", "hlo", "h", "hh", "hiii", "helloo", "helo", "hilo", "hellooo"}
@@ -241,9 +246,9 @@ class MistralLLMClient:
 
         try:
             # Generate outline for the response.
-            outline_response = self._get_outline(prompt, context)
+            # outline_response = self._get_outline(prompt, context)
             # Generate the full response with the outline guidance.
-            full_response = self._get_full_response(prompt, outline_response, context, max_length)
+            full_response = self._get_full_response(prompt, context, max_length)
             # Clean the HTML and resize headings.
             html_response = self._clean_html(full_response)
             html_response = self._resize_headings(html_response)
@@ -273,3 +278,93 @@ class MistralLLMClient:
             logger.error(f"Unexpected error in generate_response: {str(e)}")
             return ('<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
                     '<p>An unexpected error occurred. Please try again.</p></div>')
+        
+    def _get_full_response_v2(self, prompt, context=None, max_length=800):
+        if "Web Search Results:" in context:
+            # For web search queries
+            domain_expert_instructions = (
+                "You are Presage Insights' AI assistant. When web search results are provided, use them to answer the user's question. "
+                "Synthesize information from the search results to give accurate, helpful responses. "
+                "Be direct and comprehensive. "
+                "If the search results don't contain enough information to answer the question fully, state what you can determine "
+                "from the results and acknowledge any limitations."
+            )
+        else:
+            # For document queries (original behavior)
+            domain_expert_instructions = (
+                "You are a document retrieval assistant. Your primary task is to answer user questions based on the supplied document whenever possible. "
+                "First, carefully check if the document contains information relevant to the question. "
+                "If the document contains relevant information, use only that information to construct your answer. "
+                "If the document does not contain relevant information, or if the information is insufficient, you may use your own general knowledge to provide the best possible answer."
+            )
+
+        system_content = (
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive response. "
+            "The response must be concise with a clear introduction, body, and conclusion, "
+            "and integrate the following domain expertise:\n\n" + domain_expert_instructions
+        )
+        if context:
+            system_content += f"\n\nRelevant Context: {context}\n\nUse this context to inform your response."
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": prompt}
+        ]
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": max_length,
+            "top_p": 0.8
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+
+        response = requests.post(
+            self.base_url,
+            json=payload,
+            headers=headers,
+            timeout=(10, 120)
+        )
+        response.raise_for_status()
+        result = response.json()
+        full_response = result['choices'][0]['message']['content'].strip()
+        logger.info("Successfully generated full response.")
+        return full_response
+
+    def generate_response_v2(self, prompt, context=None, max_length=800):
+        overall_start = time.perf_counter()
+        logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context) if context else 0} chars")
+
+        # Check for basic greetings and return a hardcoded response if applicable.
+        basic_greetings = {"hi", "hii", "hello", "hey", "hlo", "h", "hh", "hiii", "helloo", "helo", "hilo", "hellooo"}
+        normalized_prompt = prompt.strip().lower()
+        if normalized_prompt in basic_greetings:
+            hardcoded_response = "Hello! How can I assist you today with predictive maintenance or asset performance insights?"
+            logger.info("Returning hardcoded greeting response.")
+            return hardcoded_response
+
+        try:
+            # Generate the full response
+            response = self._get_full_response_v2(prompt, context, max_length)
+            
+            overall_elapsed = time.perf_counter() - overall_start
+            logger.info(f"Total generate_response time: {overall_elapsed:.2f} seconds.")
+            return response
+
+        except requests.Timeout:
+            logger.error("Mistral API request timed out")
+            return "Sorry, the response is taking too long. Please try again later."
+        except requests.RequestException as e:
+            logger.error(f"Mistral API request failed: {str(e)}")
+            return "I apologize, but I'm having trouble processing your request. Please try again later."
+        except KeyError as e:
+            logger.error(f"Unexpected response format from Mistral API: {str(e)}")
+            return "I encountered an error while generating a response. Please try again."
+        except Exception as e:
+            logger.error(f"Unexpected error in generate_response: {str(e)}")
+            return "An unexpected error occurred. Please try again."

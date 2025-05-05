@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-
+from corsheaders.defaults import default_headers
 # Load environment variables
 load_dotenv()
 
@@ -49,7 +49,6 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOWED_ORIGINS = [
     "http://ml.presageinsights.ai",
     "https://ml.presageinsights.ai",
@@ -57,6 +56,9 @@ CORS_ALLOWED_ORIGINS = [
     "https://13.201.85.22",
     "http://127.0.0.1",
 ]
+
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOW_METHODS = [
     'DELETE',
@@ -67,7 +69,7 @@ CORS_ALLOW_METHODS = [
     'PUT',
 ]
 
-CORS_ALLOW_HEADERS = [
+CORS_ALLOW_HEADERS =  list(default_headers) + [
     'accept',
     'accept-encoding',
     'authorization',
@@ -77,6 +79,12 @@ CORS_ALLOW_HEADERS = [
     'user-agent',
     'x-csrftoken',
     'x-requested-with',
+    'x-user-id',
+]
+
+CORS_EXPOSE_HEADERS = [
+    'Authorization',
+    'X-User-ID',
 ]
 
 ROOT_URLCONF = 'asset_support_bot.urls'
@@ -167,21 +175,27 @@ CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 REDIS_HOST = os.environ.get('REDIS_HOST', 'asset-support-bot-redis-1')
 REDIS_PORT = os.environ.get('REDIS_PORT', '6379')
 # Document upload settings
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024  # 20 MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024  # 20 MB
-
 # LLM Settings
 LLM_MODEL_ID = os.getenv('LLM_MODEL_ID', 'mistralai/Mistral-7B-Instruct-v0.2')
 EMBEDDING_MODEL_ID = os.getenv('EMBEDDING_MODEL_ID', 'all-MiniLM-L6-v2')
 HF_ACCESS_TOKEN = os.getenv('HF_ACCESS_TOKEN', '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')
 MISTRAL_API_KEY = os.getenv('MISTRAL_API_KEY', 'VrqhfV38Mxr8T90JzfEZ0cjINtm6Th5o')
-# GROQ_API_KEY = os.getenv('GROQ_API_KEY', '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')
-GROQ_API_KEY = os.getenv('GROQ_API_KEY', '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')
+#GROQ_API_KEY = os.getenv('GROQ_API_KEY', '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')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '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')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAN7hPbw5T0y20R3AEjyaiQAZL67oV5thA')
+SERPAPI_KEY = os.getenv('SERPAPI_KEY', 'a64064c88af685be70853dbb69756ac644bc9fde371a4771b5780f325762b5fc')
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "8546793cdb3e3f30ee84c1f5086f9888")
+DATA_UPLOAD_MAX_MEMORY_SIZE = 20971520  # 20MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 20971520  # 20MB
 
 # Pinecone settings
 PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')

@@ -69,7 +69,11 @@ class GeminiLLMClient:
 
     def _clean_html(self, html):
         if not html:
-            return '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;"></div>' # Return empty container if no input
+            return '<div class="response-container" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;"></div>'  # Return empty container if no input
+
+        # Remove any Markdown code fences if present (e.g., ```html ... ```)
+        html = re.sub(r'^```html\s*', '', html)
+        html = re.sub(r'\s*```$', '', html)
 
         # Remove newlines and tabs.
         html = re.sub(r'[\n\t]+', ' ', html)
@@ -86,18 +90,15 @@ class GeminiLLMClient:
         if container_start_pattern.search(html) and container_end_pattern.search(html):
             # Already has container, ensure style exists or add it
             if 'style=' not in container_start_pattern.search(html).group(0):
-                 html = container_start_pattern.sub(f'<div class="response-container" {style_attr}>', html, count=1)
+                html = container_start_pattern.sub(f'<div class="response-container" {style_attr}>', html, count=1)
             return html
 
-        # Remove any existing top-level response container divs (case-insensitive) if logic failed above or structure is broken
+        # Remove any existing top-level response container divs (if structure is broken)
         html = container_start_pattern.sub('', html).strip()
-        # Remove closing div if it's at the very end (after potentially removing the start)
         if html.endswith('</div>'):
-            # More robust check to avoid removing nested divs' closings
             temp_html = html[:-len('</div>')].strip()
-            # Very basic check: if the remaining doesn't look like it started with a div, assume it was the container end
             if not temp_html.startswith('<div'):
-                 html = temp_html
+                html = temp_html
 
         # Wrap the cleaned content with a styled container div
         html_response = f'<div class="response-container" {style_attr}>{html}</div>'
@@ -173,10 +174,10 @@ class GeminiLLMClient:
 
         try:
             # 1. Get Outline (using Gemini)
-            outline_response = self._get_outline(prompt, context)
+            # outline_response = self._get_outline(prompt, context)
 
             # 2. Get Full Response (using Gemini with outline)
-            full_response = self._get_full_response(prompt, outline_response, context, max_length)
+            full_response = self._get_full_response(prompt, context, max_length)
 
             # 3. Clean, Resize Headings, and Validate/Repair HTML (Unchanged logic, applied to Gemini output)
             html_response = self._clean_html(full_response)
@@ -337,24 +338,36 @@ class GeminiLLMClient:
             # Fallback outline if Gemini fails
             return "<h6>Topic Overview</h6><ul><li>Key points</li></ul><h6>Details</h6><ul><li>Important details</li></ul><h6>Conclusion</h6><ul><li>Summary points</li></ul>"
 
-    def _get_full_response(self, prompt, outline, context=None, max_length=800):
-        # System instruction specific to generating the FULL RESPONSE, incorporating domain expertise and format requirements.
-        domain_expert_instructions = (
-            "You are a document retrieval system. Your task is to provide accurate and precise answers to user questions based solely on the information contained within the supplied document. "
-            "Do not include any information that is not explicitly stated in the document. If the document does not contain the answer, respond with 'The answer to your question cannot be found in the document.'"
-        )
+    def _get_full_response(self, prompt, context=None, max_length=800):
+        # Modified system instruction to properly handle web search results
+        if "Web Search Results:" in context:
+            # For web search queries
+            domain_expert_instructions = (
+                "You are Presage Insights' AI assistant. When web search results are provided, use them to answer the user's question. "
+                "Synthesize information from the search results to give accurate, helpful responses. "
+                "Be direct and comprehensive. Format your response with appropriate HTML for readability. "
+                "If the search results don't contain enough information to answer the question fully, state what you can determine "
+                "from the results and acknowledge any limitations."
+            )
+        else:
+            # For document queries (original behavior)
+            domain_expert_instructions = (
+                "You are a document retrieval assistant. Your primary task is to answer user questions based on the supplied document whenever possible. "
+                "First, carefully check if the document contains information relevant to the question. "
+                "If the document contains relevant information, use only that information to construct your answer. "
+                "If the document does not contain relevant information, or if the information is insufficient, you may use your own general knowledge to provide the best possible answer."
+            )
 
         system_instruction = (
-            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response that strictly follows the outline below. "
+            "You are a precise technical support assistant for the Presage Insights platform. Generate a comprehensive HTML response. "
             "Ensure the entire output starts with '<div class=\"response-container\">' and ends with '</div>', uses proper HTML tags (<p>, <h6>, <strong>) and lists (<ul>/<ol>), "
-            "and is entirely valid with all tags closed. The response must be concise, complete all outlined sections with a clear introduction, body, and conclusion, "
+            "and is entirely valid with all tags closed. The response must be concise with a clear introduction, body, and conclusion, "
             "and integrate the following domain expertise:\n\n" + domain_expert_instructions
         )
 
         if context:
             system_instruction += f"\n\nRelevant Context: {context}\n\nIntegrate this context naturally into your response."
 
-        logger.info("Generating full response from Gemini with outline guidance...")
         try:
             full_response = self._gemini_api_call(
                 system_instruction=system_instruction,
@@ -376,34 +389,45 @@ class GeminiLLMClient:
     def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
         logger.info("Querying Gemini LLM directly...")
 
-        # Convert OpenAI message format to Gemini 'contents' format
-        contents = []
+        # Detect web‐search context
+        is_web_search = any(
+            msg['role'] == 'user' and 'WEB SEARCH RESULTS:' in msg['content'] 
+            for msg in messages
+        )
+        if is_web_search:
+            logger.info("Detected web search query")
+
+        # Extract system and user prompts
         system_instruction = ""
-        current_user_prompt = ""
-
-        # Extract system prompt first if present
         if messages and messages[0]['role'] == 'system':
-            system_instruction = messages[0]['content']
-            messages = messages[1:] # Remove system message for turn processing
+            system_instruction = messages.pop(0)['content']
 
-        # Process remaining messages (assuming simple user/assistant turns for direct query)
-        # This simple conversion combines system prompt with the first user message
-        if messages and messages[0]['role'] == 'user':
-             current_user_prompt = messages[0]['content']
-             combined_first_prompt = f"{system_instruction}\n\n{messages[0]['content']}".strip()
-             contents.append({"role": "user", "parts": [{"text": combined_first_prompt}]})
-             # Note: This doesn't handle subsequent turns in the messages list well for the REST API.
-             # It primarily sends the system + first user prompt.
-        elif system_instruction: # Handle case where only a system prompt was given (unlikely but possible)
-             contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+        if not messages or messages[0]['role'] != 'user':
+            logger.error("query_llm requires at least one user message")
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Error:</strong> No user message provided. Please retry with a valid query.</p>'
+                '</div>'
+            )
+
+        user_content = messages[0]['content']
+        if is_web_search:
+            user_prompt = (
+                f"{system_instruction}\n\n"
+                "IMPORTANT: You are answering a factual question using web search results. "
+                "Extract and present relevant information directly from the results, without "
+                "disclaimers about document limitations.\n\n"
+                f"{user_content}"
+            )
         else:
-             logger.error("query_llm requires at least a user message.")
-             return "Error: No user message provided for query."
+            user_prompt = f"{system_instruction}\n\n{user_content}".strip()
 
+        payload_contents = [{"role": "user", "parts": [{"text": user_prompt}]}]
 
-        # Construct the Gemini payload
+        # Build payload
         payload = {
-            "contents": contents,
+            "contents": payload_contents,
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
@@ -414,45 +438,62 @@ class GeminiLLMClient:
         url = f"{self.generate_url}?key={self.api_key}"
 
         try:
-            response = requests.post(url, json=payload, headers=headers, timeout=(10, 180))
-            response.raise_for_status()
-            result = response.json()
-
-            if not result.get('candidates'):
-                 finish_reason = result.get('promptFeedback', {}).get('blockReason')
-                 if finish_reason:
-                     logger.error(f"Gemini direct query blocked. Reason: {finish_reason}")
-                     return f"Request failed due to safety settings or other issue: {finish_reason}"
-                 else:
-                     logger.error(f"Gemini direct query response missing 'candidates'.")
-                     return "Error: Unexpected response format from Gemini (missing candidates)."
-
-            content = result['candidates'][0].get('content', {})
-            parts = content.get('parts', [])
-            if not parts or 'text' not in parts[0]:
-                 logger.error(f"Gemini direct query response missing 'text' in parts.")
-                 return "Error: Unexpected response format from Gemini (missing text)."
-
-            reply = parts[0]['text'].strip()
-            logger.info("Received direct response from Gemini LLM.")
-            return reply
-
+            resp = requests.post(url, json=payload, headers=headers, timeout=(10, 180))
+            resp.raise_for_status()
         except requests.Timeout:
             logger.error("Gemini LLM direct query timed out")
-            return "Request timed out. Please try again."
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Timeout:</strong> The request took too long (180s). '
+                'Please try again or reduce the request size.</p>'
+                '</div>'
+            )
         except requests.RequestException as e:
-            error_detail = ""
-            if e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    error_detail = f" - {error_data.get('error', {}).get('message', e.response.text)}"
-                except json.JSONDecodeError:
-                    error_detail = f" - Status Code: {e.response.status_code}"
-            logger.error(f"Gemini LLM direct query failed: {str(e)}{error_detail}")
-            return "Request failed. Please check logs."
-        except (KeyError, IndexError, ValueError) as e:
-            logger.error(f"Unexpected response format or processing error in direct query: {str(e)}")
-            return "Unexpected error occurred while parsing the LLM response."
-        except Exception as e:
-            logger.error(f"General error in query_llm: {str(e)}", exc_info=True)
-            return "Unexpected error. Please try again later."
+            # Capture any HTTP/non-2xx errors
+            status = getattr(e.response, 'status_code', 'N/A')
+            text = getattr(e.response, 'text', str(e))
+            logger.error(f"Gemini LLM direct query failed: HTTP {status} - {text}")
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p><strong>API Error (Status {status}):</strong> {text}</p>'
+                '<p>Please check your API key, network connection, and try again.</p>'
+                '</div>'
+            )
+
+        # Parse JSON
+        try:
+            result = resp.json()
+            candidates = result.get('candidates', [])
+            if not candidates:
+                raise KeyError("No candidates in response")
+
+            parts = candidates[0].get('content', {}).get('parts', [])
+            if not parts or 'text' not in parts[0]:
+                raise KeyError("Missing 'text' in candidate parts")
+
+            reply = parts[0]['text'].strip()
+
+        except (ValueError, KeyError) as e:
+            # JSON decode or missing fields
+            logger.error(f"Parse error from Gemini response: {e} -- full response: {resp.text}")
+            return (
+                '<div class="response-container error" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                '<p><strong>Response Format Error:</strong> Unexpected format from Gemini. '
+                'Please try again or contact support if this persists.</p>'
+                '</div>'
+            )
+
+        # Wrap plain text in a container if needed
+        if is_web_search and not reply.startswith('<div class="response-container"'):
+            reply = (
+                '<div class="response-container" '
+                'style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
+                f'<p>{reply}</p>'
+                '</div>'
+            )
+
+        logger.info("Received direct response from Gemini LLM.")
+        return reply

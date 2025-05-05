@@ -17,6 +17,7 @@ class Message(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     conversation = models.ForeignKey(Conversation, related_name='messages', on_delete=models.CASCADE)
     is_user = models.BooleanField(default=True, help_text="True if message is from user, False if from system")
+    processing_status = models.CharField(max_length=50, default="pending")
     content = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
     
