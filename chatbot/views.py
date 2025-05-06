@@ -316,24 +316,24 @@ class ChatbotViewSet(viewsets.ViewSet):
                 conv_future = executor.submit(self._get_cached_or_build_conversation_context, conversation, message_content)
 
                 try:
-                    document_context, context_chunks_count = doc_future.result(timeout=18.0)
+                    document_context, context_chunks_count = doc_future.result(timeout=30.0)
                     logger.info(f"Document context retrieved. Chunks count: {context_chunks_count}")
                     logger.info(f"Document context content (preview): {document_context[:300] if document_context else 'No context found'}")
                     timings['document_context_time'] = "Completed"
                 except TimeoutError:
                     logger.error("Document context retrieval timed out")
                     document_context, context_chunks_count = "", 0
-                    timings['document_context_time'] = "TIMEOUT after 18.0 seconds"
+                    timings['document_context_time'] = "TIMEOUT after 30.0 seconds"
 
                 try:
-                    conversation_context = conv_future.result(timeout=8.0)
+                    conversation_context = conv_future.result(timeout=18.0)
                     logger.info("Conversation context successfully retrieved")
                     timings['conversation_context_time'] = "Completed"
                 except TimeoutError:
                     logger.error("Conversation context building timed out")
                     conversation_context = self._build_minimal_context_prompt(conversation, max_recent=2)
                     logger.info("Fallback: Built minimal conversation context")
-                    timings['conversation_context_time'] = "TIMEOUT after 8.0 seconds"
+                    timings['conversation_context_time'] = "TIMEOUT after 18.0 seconds"
         except Exception as e:
             logger.error("Error during parallel retrieval: %s", str(e))
             document_context, context_chunks_count = "", 0
@@ -392,7 +392,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                         context=combined_prompt
                     )
                     # Adjust timeout for fallback attempts - shorter timeouts for subsequent attempts
-                    timeout_duration = 20.0 if idx == 0 else 15.0 if idx == 1 else 10.0
+                    timeout_duration = 120.0 if idx == 0 else 115.0 if idx == 1 else 110.0
                     response_content = future.result(timeout=timeout_duration)
                     
                     logger.info(f"LLM {type(llm_client).__name__} response successfully generated")
@@ -593,7 +593,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                         similarity_threshold=similarity_threshold
                     )
                     # Progressive timeout: shorter for first attempt, longer for subsequent
-                    timeout = 8.0 if batch_size < top_k else 15.0
+                    timeout = 18.0 if batch_size < top_k else 25.0
                     batch_chunks = future.result(timeout=timeout)
                     
                     # Add new unique chunks to our results

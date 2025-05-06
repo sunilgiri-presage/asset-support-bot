@@ -203,7 +203,7 @@ class GroqLLMClient:
                 self.base_url,
                 json=payload,
                 headers=headers,
-                timeout=(10, 120)
+                timeout=(20, 150)
             )
             
             response.raise_for_status()
@@ -271,7 +271,7 @@ class GroqLLMClient:
             self.base_url,
             json=payload,
             headers=headers,
-            timeout=(10, 120)
+            timeout=(20, 150)
         )
         
         response.raise_for_status()
@@ -320,7 +320,7 @@ class GroqLLMClient:
                 self.base_url,
                 json=payload,
                 headers=headers,
-                timeout=(10, 120)
+                timeout=(20, 150)
             )
             response.raise_for_status()
         except requests.Timeout:
@@ -424,7 +424,7 @@ class GroqLLMClient:
             self.base_url,
             json=payload,
             headers=headers,
-            timeout=(10, 120)
+            timeout=(20, 150)
         )
         response.raise_for_status()
         result = response.json()

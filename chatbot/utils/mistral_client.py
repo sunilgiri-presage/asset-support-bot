@@ -153,7 +153,7 @@ class MistralLLMClient:
                 self.base_url,
                 json=payload,
                 headers=headers,
-                timeout=(10, 120)
+                timeout=(20, 150)
             )
             response.raise_for_status()
             result = response.json()
@@ -220,7 +220,7 @@ class MistralLLMClient:
             self.base_url,
             json=payload,
             headers=headers,
-            timeout=(10, 120)
+            timeout=(20, 150)
         )
         response.raise_for_status()
         result = response.json()
@@ -328,7 +328,7 @@ class MistralLLMClient:
             self.base_url,
             json=payload,
             headers=headers,
-            timeout=(10, 120)
+            timeout=(20, 150)
         )
         response.raise_for_status()
         result = response.json()
