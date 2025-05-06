@@ -47,7 +47,7 @@ def process_fetch_data(message_id, asset_id, user_message_content, authorization
                 headers['X-User-ID'] = x_user_id
 
             # Fetch data from API
-            api_url = f"http://192.168.1.36:8090/api/asset-data/{asset_id}/"
+            api_url = f"https://processor.presageinsights.ai/api/api/asset-data/{asset_id}/"
             response = requests.get(api_url, headers=headers, timeout=120)  # Added timeout
             
             if response.status_code == 200:
@@ -518,7 +518,7 @@ Mount Data Summary:
         rpm = mount.get('running_RPM', 0)
         
         super_prompt += f"""
-Mount {i+1} (ID: {mount_id}, Name: {mount.get('endpoint_name', 'Unknown Endpoint')}, RPM: {rpm}):
+Mount {i+1} (ID: {mount_id}, Name: {mount.get('endpoint_name', 'Unknown Endpoint')}, RPM: {rpm if rpm != 0 else 'data not found'}):
 """
         # Add summary for each axis
         for axis_name, axis_data in mount.get('axes', {}).items():
@@ -533,12 +533,12 @@ Mount {i+1} (ID: {mount_id}, Name: {mount.get('endpoint_name', 'Unknown Endpoint
             
             super_prompt += f"""
   {axis_name} Axis:
-   - Velocity: RMS={v_rms} mm/s, Peak={v_peak} mm/s
-   - Acceleration: RMS={a_rms} g
-   - Harmonics: 1X={harmonics.get('one_amp', 0)}, 2X={harmonics.get('two_amp', 0)}, 3X={harmonics.get('three_amp', 0)}
-   - Key Bearing Frequencies: BPFO={axis_data.get('bearing_fault_frequencies', {}).get('bpfo_amp', [])[0] if axis_data.get('bearing_fault_frequencies', {}).get('bpfo_amp', []) else 'N/A'}, 
-     BPFI={axis_data.get('bearing_fault_frequencies', {}).get('bpfi_amp', [])[0] if axis_data.get('bearing_fault_frequencies', {}).get('bpfi_amp', []) else 'N/A'},
-     BSF={axis_data.get('bearing_fault_frequencies', {}).get('bsf_amp', [])[0] if axis_data.get('bearing_fault_frequencies', {}).get('bsf_amp', []) else 'N/A'}
+   - Velocity: RMS={v_rms if v_rms != 0 else 'data not found'} mm/s, Peak={v_peak if v_peak != 0 else 'data not found'} mm/s
+   - Acceleration: RMS={a_rms if a_rms != 0 else 'data not found'} g
+   - Harmonics: 1X={harmonics.get('one_amp') if harmonics.get('one_amp', 0) != 0 else 'data not found'}, 2X={harmonics.get('two_amp') if harmonics.get('two_amp', 0) != 0 else 'data not found'}, 3X={harmonics.get('three_amp') if harmonics.get('three_amp', 0) != 0 else 'data not found'}
+   - Key Bearing Frequencies: BPFO={axis_data.get('bearing_fault_frequencies', {}).get('bpfo_amp', [])[0] if axis_data.get('bearing_fault_frequencies', {}).get('bpfo_amp', []) else 'data not found'}, 
+     BPFI={axis_data.get('bearing_fault_frequencies', {}).get('bpfi_amp', [])[0] if axis_data.get('bearing_fault_frequencies', {}).get('bpfi_amp', []) else 'data not found'},
+     BSF={axis_data.get('bearing_fault_frequencies', {}).get('bsf_amp', [])[0] if axis_data.get('bearing_fault_frequencies', {}).get('bsf_amp', []) else 'data not found'}
 """
 
     super_prompt += """
@@ -569,10 +569,10 @@ No markdown, no code fences, no extra text.
 """
 
     # Invoke LLM
-    from chatbot.utils.mistral_client import MistralLLMClient
-    mistral_client = MistralLLMClient()
+    from chatbot.utils.gemini_client import GeminiLLMClient
+    gemini_client = GeminiLLMClient()
     try:
-        response_text = mistral_client.generate_response_v2(
+        response_text = gemini_client.generate_response_v2(
             prompt=super_prompt,
             context=user_message_content
         )
@@ -599,6 +599,7 @@ No markdown, no code fences, no extra text.
         # Fallback minimal structure
         return {
             "overview": "Error encountered during analysis.",
+            "asset_name": asset_name,
             "mount_analysis": [
                 {
                     "mount_id": m.get('mount_id', 'unknown'),
