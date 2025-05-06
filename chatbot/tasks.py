@@ -105,7 +105,7 @@ def process_fetch_data(message_id, asset_id, user_message_content, authorization
                 if analysis_result:
                     # Choose LLM client based on complexity of analysis_result
                     analysis_str = json.dumps(analysis_result)
-                    client_choice = "GeminiLLMClient" if len(analysis_str.split()) > 200 else "GroqLLMClient"
+                    client_choice = "GeminiLLMClient" if len(analysis_str.split()) > 300 else "GroqLLMClient"
                     llm_client = GeminiLLMClient() if client_choice == "GeminiLLMClient" else GroqLLMClient()
                     logger.info(f"Using {client_choice} for fetch_data.")
 

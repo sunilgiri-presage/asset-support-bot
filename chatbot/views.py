@@ -217,7 +217,7 @@ class ChatbotViewSet(viewsets.ViewSet):
                     f"User: {message_content}\n"
                     f"Assistant: {response_content}"
                 )
-                new_summary = mistral_client.generate_response(prompt=summary_prompt, context="")
+                new_summary = mistral_client.generate_response_v2(prompt=summary_prompt, context="")
                 timings['assistant_message_save_time'] = f"{time.perf_counter() - assist_msg_start:.2f} seconds"
 
                 if conversation.summary:
