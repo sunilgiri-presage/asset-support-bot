@@ -117,7 +117,7 @@ class GroqLLMClient:
         logger.info("Repaired incomplete HTML response")
         return repaired
 
-    def generate_response(self, prompt, context=None, max_length=800):
+    def generate_response(self, prompt, context=None, max_length=1500):
         overall_start = time.perf_counter()
         
         # Check for basic greetings and return a hardcoded response if applicable.
@@ -218,7 +218,7 @@ class GroqLLMClient:
             # Return a basic outline if outline generation fails
             return "<h6>Topic Overview</h6><ul><li>Key points</li></ul><h6>Details</h6><ul><li>Important details</li></ul><h6>Conclusion</h6><ul><li>Summary points</li></ul>"
 
-    def _get_full_response(self, prompt, context=None, max_length=800):
+    def _get_full_response(self, prompt, context=None, max_length=1500):
         # Domain expert instructions for the Presage Insights platform
         if "Web Search Results:" in context:
             # For web search queries
@@ -289,7 +289,7 @@ class GroqLLMClient:
         return html
     
 
-    def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
+    def query_llm(self, messages, temperature=0.5, max_tokens=1500, top_p=0.9):
         logger.info("Querying Groq LLM directly...")
 
         # Ensure there is at least one user message
@@ -375,7 +375,7 @@ class GroqLLMClient:
 
         logger.info("Received response from Groq LLM.")
         return reply
-    def _get_full_response_v2(self, prompt, context=None, max_length=800):
+    def _get_full_response_v2(self, prompt, context=None, max_length=1500):
         if "Web Search Results:" in context:
             # For web search queries
             domain_expert_instructions = (
@@ -432,7 +432,7 @@ class GroqLLMClient:
         logger.info("Successfully generated full response.")
         return full_response
 
-    def generate_response_v2(self, prompt, context=None, max_length=800):
+    def generate_response_v2(self, prompt, context=None, max_length=1500):
         overall_start = time.perf_counter()
         logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context) if context else 0} chars")
 

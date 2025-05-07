@@ -170,7 +170,7 @@ class MistralLLMClient:
                 "<h6>Conclusion</h6><ul><li>Summary points</li></ul>"
             )
 
-    def _get_full_response(self, prompt, context=None, max_length=800):
+    def _get_full_response(self, prompt, context=None, max_length=1500):
         if "Web Search Results:" in context:
             # For web search queries
             domain_expert_instructions = (
@@ -228,7 +228,7 @@ class MistralLLMClient:
         logger.info("Successfully generated full response.")
         return full_response
 
-    def generate_response(self, prompt, context=None, max_length=800):
+    def generate_response(self, prompt, context=None, max_length=1500):
         overall_start = time.perf_counter()
         logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context)} chars")
 
@@ -279,7 +279,7 @@ class MistralLLMClient:
             return ('<div class="response-container error" style="font-family: Arial, sans-serif; line-height: 1.6; padding: 1em;">'
                     '<p>An unexpected error occurred. Please try again.</p></div>')
         
-    def _get_full_response_v2(self, prompt, context=None, max_length=800):
+    def _get_full_response_v2(self, prompt, context=None, max_length=1500):
         if "Web Search Results:" in context:
             # For web search queries
             domain_expert_instructions = (
@@ -336,7 +336,7 @@ class MistralLLMClient:
         logger.info("Successfully generated full response.")
         return full_response
 
-    def generate_response_v2(self, prompt, context=None, max_length=800):
+    def generate_response_v2(self, prompt, context=None, max_length=1500):
         overall_start = time.perf_counter()
         logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context) if context else 0} chars")
 

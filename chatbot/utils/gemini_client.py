@@ -156,7 +156,7 @@ class GeminiLLMClient:
 
     # --- Core Generation Logic ---
 
-    def generate_response(self, prompt, context=None, max_length=800): # Increased default max_length for potentially more verbose Gemini
+    def generate_response(self, prompt, context=None, max_length=1500): # Increased default max_length for potentially more verbose Gemini
         overall_start = time.perf_counter()
 
         # Basic greeting check (Unchanged)
@@ -338,7 +338,7 @@ class GeminiLLMClient:
             # Fallback outline if Gemini fails
             return "<h6>Topic Overview</h6><ul><li>Key points</li></ul><h6>Details</h6><ul><li>Important details</li></ul><h6>Conclusion</h6><ul><li>Summary points</li></ul>"
 
-    def _get_full_response(self, prompt, context=None, max_length=800):
+    def _get_full_response(self, prompt, context=None, max_length=1500):
         # Modified system instruction to properly handle web search results
         if "Web Search Results:" in context:
             # For web search queries
@@ -386,7 +386,7 @@ class GeminiLLMClient:
 
     # --- Direct Query Method (Optional - If you need a raw query interface) ---
 
-    def query_llm(self, messages, temperature=0.5, max_tokens=800, top_p=0.9):
+    def query_llm(self, messages, temperature=0.5, max_tokens=1500, top_p=0.9):
         logger.info("Querying Gemini LLM directly...")
 
         # Detect web‐search context
@@ -498,7 +498,7 @@ class GeminiLLMClient:
         logger.info("Received direct response from Gemini LLM.")
         return reply
 
-    def _get_full_response_v2(self, prompt, context=None, max_length=800):
+    def _get_full_response_v2(self, prompt, context=None, max_length=1500):
         if "Web Search Results:" in context:
             # For web search queries
             domain_expert_instructions = (
@@ -540,7 +540,7 @@ class GeminiLLMClient:
             # Re-raise the exception to be caught by the main generate_response handler
             raise
 
-    def generate_response_v2(self, prompt, context=None, max_length=800):
+    def generate_response_v2(self, prompt, context=None, max_length=1500):
         overall_start = time.perf_counter()
         logger.info(f"LLM input - prompt: {len(prompt)} chars, context: {len(context) if context else 0} chars")
 

@@ -8,7 +8,7 @@ if [ "$1" = "gunicorn" ]; then
   python manage.py makemigrations
   python manage.py migrate
   # Collect static files
-  python manage.py collectstatic --noinput
+  # python manage.py collectstatic --noinput
 fi
 
 # Execute the container's main command
